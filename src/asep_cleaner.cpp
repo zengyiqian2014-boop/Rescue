@@ -151,7 +151,8 @@ static void scanWinlogon() {
                     std::wstring signer; sig::Trust t = exe.empty() ? sig::Trust::Missing : sig::Verify(exe, &signer);
                     report(v, one, exe, t, signer);
                 }
-                if (comma == std::wstring::npos) break; start = comma + 1;
+                if (comma == std::wstring::npos) break;
+                start = comma + 1;
             }
         }
     }

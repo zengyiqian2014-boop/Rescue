@@ -4,8 +4,8 @@ An **active-defense** ransomware rescue & anti-malware toolkit for Windows —
 built to *unlock*, *clean*, and *guard* a machine that malware has taken over.
 Cross-compiled with **MinGW** for both **x86_64** and **ARM64** Windows.
 
-> **Status: early, honest work-in-progress.** Module 1 (Lockdown Breaker) is
-> real and working. The rest is on the roadmap below. Read the
+> **Status: work-in-progress, honestly labelled.** Modules 1–5 build and run;
+> Module 6 is reviewable source that needs a WDK build and a signing cert. Read the
 > [Honest scope](#honest-scope) section before expecting a "full antivirus" —
 > some of that goal has hard technical limits, and this README is straight with
 > you about them.
@@ -52,7 +52,7 @@ that work:
 | **1b** | **Offline WinPE rescue** | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | ✅ **working** |
 | **2** | **ASEP Cleaner** | Enumerate *all* autostart points (Run, services, tasks, IFEO, Winlogon, startup) and flag/quarantine unsigned entries — Authenticode-verified, generic, not per-virus | ✅ **working** |
 | **3** | **Anti-ransomware guard** | Honeypot canary files + directory watcher + mass-change detection → suspend/kill the busiest writer's process tree | ✅ **working** |
-| 4 | Scanner | Integrate the **ClamAV** engine + scheduled scans; downloaded files (Mark-of-the-Web) get top-priority deep scan | planned |
+| **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
 | **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete; needs WDK build + signing | 🧩 **source** |
 
@@ -147,6 +147,62 @@ before removing them, renames flagged startup files (never deletes), and sets
 flagged services to *Disabled*. Scheduled tasks are reported, not touched. A
 flag means *unsigned*, not *definitely malicious* — review before quarantining.
 
+## Module 4 — Scanner
+
+An on-demand file scanner. Being straight about the hard part first: **a real
+signature database is an operational product**, not something a source tree can
+ship — millions of samples and daily updates. So this scanner is built on the
+three things that work *without* a virus database, and it delegates to a real
+engine when one is installed.
+
+```
+scanner                        quick scan: Downloads, Desktop, Documents, Temp,
+                               Roaming, Public, startup folders
+scanner --full                 every fixed drive (skips WinSxS/servicing)
+scanner --path DIR|FILE        scan a specific path (repeatable)
+scanner --db HASHES.txt        SHA-256 blocklist (paste IOC hashes straight in)
+scanner --min-score N          report threshold (default 4; >= 8 prints HIGH)
+scanner --clam                 run a local ClamAV over the detections
+scanner --quarantine           move detections aside (reversible)
+scanner --list-quarantine      show what has been quarantined
+scanner --restore ID           put a quarantined file back
+scanner --schedule-daily 03:00 register a daily scheduled scan
+```
+
+**What it actually reasons about**
+
+1. **Authenticode trust first** (`signature.h`, embedded *and* catalog). A file
+   vouched for by a trusted signer is the overwhelming majority of a clean disk;
+   clearing it up front is what makes scanning the rest affordable.
+2. **Mark-of-the-Web.** Windows records download provenance in the
+   `:Zone.Identifier` alternate data stream. *Downloaded + unsigned + executable*
+   is the highest-yield triage signal on a real infection, so those files get
+   priority and the report prints the originating URL when it's recorded.
+3. **PE structure.** Packer-grade entropy in the code section, a section that is
+   both writable and executable, packer section names (`UPX0`, `.vmp0`, …), an
+   empty import table (APIs resolved at runtime), TLS callbacks, a mostly-overlay
+   file, a name that impersonates a system binary from the wrong directory, a
+   double extension (`invoice.pdf.exe`).
+4. **Script markers** for `.ps1/.vbs/.js/.hta/.bat/.lnk` droppers — encoded
+   commands, `FromBase64String` + `IEX`, hidden-window execution policy bypass,
+   `certutil` as a decoder, and the destructive tells (`vssadmin delete shadows`,
+   `bcdedit /set recoveryenabled no`, Defender exclusions).
+
+**Scores are a ranking for a human, not a verdict.** Every point printed carries
+its reason, so you can see exactly why a file ranked where it did. Only a hash
+blocklist hit is reported as a fact (`KNOWN-BAD`); everything else is a weighted
+heuristic. Unsigned *alone* scores 1 — far below the threshold — which is why a
+sweep of 700 unsigned binaries produces zero findings.
+
+**Quarantine is reversible by construction:** the file is *moved* (never
+deleted) into `%ProgramData%\Rescue\Quarantine` and an append-only manifest
+records the original path, hash, score, and reasons, so `--restore` puts it back.
+
+**Why not ClamAV built in?** `libclamav` is MSVC/autotools C that does not
+cross-compile with MinGW; vendoring a broken half-port would be worse than being
+honest. If you have a real ClamAV install, `--clam` hands the flagged files to
+`clamdscan`/`clamscan` — its engine and daily signatures beat anything here.
+
 ## Module 5 — Watchdog
 
 A protection tool a malicious process can just kill is no protection. This is a
@@ -195,7 +251,7 @@ signature can't stop you deleting it.
 
 ```bash
 make          # both tools, both architectures
-make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard,asep_cleaner,watchdog}.exe
+make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard,asep_cleaner,watchdog,scanner}.exe
 make arm64    # -> build/arm64/{...}.exe    (llvm-mingw Clang)
 ```
 

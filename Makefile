@@ -19,11 +19,12 @@ CXXFLAGS  = -O2 -std=c++17 -municode -Wall -Wextra \
 # uses std::thread (winpthreads, linked statically by the flags above).
 LDFLAGS   = -Wl,--subsystem,console -pthread
 # -lwintrust -lcrypt32: Authenticode verification in asep_cleaner (signature.h).
+# -lbcrypt: SHA-256 (CNG) in scanner.
 # mingw ignores #pragma comment(lib), so the libs must be listed here.
-LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi -lwintrust -lcrypt32
+LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi -lwintrust -lcrypt32 -lbcrypt
 
 # Tools: internal name -> is built for both arches.
-TOOLS     = lockdown_breaker ransom_guard asep_cleaner watchdog
+TOOLS     = lockdown_breaker ransom_guard asep_cleaner watchdog scanner
 
 X64_OUT   = $(patsubst %,build/x86_64/%.exe,$(TOOLS))
 ARM64_OUT = $(patsubst %,build/arm64/%.exe,$(TOOLS))
@@ -33,13 +34,13 @@ all: x64 arm64
 x64:   $(X64_OUT)
 arm64: $(ARM64_OUT)
 
-build/x86_64/%.exe: src/%.cpp src/%.rc src/privilege.h src/rescue.manifest
+build/x86_64/%.exe: src/%.cpp src/%.rc src/privilege.h src/signature.h src/rescue.manifest
 	@mkdir -p build/x86_64
 	$(X64_WINDRES) src/$*.rc -O coff -o build/x86_64/$*_res.o
 	$(X64_CXX) $(CXXFLAGS) $< build/x86_64/$*_res.o -o $@ $(LDFLAGS) $(LIBS)
 	@echo "built $@"
 
-build/arm64/%.exe: src/%.cpp src/%.rc src/privilege.h src/rescue.manifest
+build/arm64/%.exe: src/%.cpp src/%.rc src/privilege.h src/signature.h src/rescue.manifest
 	@mkdir -p build/arm64
 	$(ARM64_WINDRES) src/$*.rc -O coff -o build/arm64/$*_res.o
 	$(ARM64_CXX) $(CXXFLAGS) $< build/arm64/$*_res.o -o $@ $(LDFLAGS) $(LIBS)
