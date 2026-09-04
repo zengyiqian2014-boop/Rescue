@@ -49,9 +49,9 @@ that work:
 | Phase | Module | What it does | State |
 | --- | --- | --- | --- |
 | **1** | **Lockdown Breaker** | Undo restriction policies, shell hijack, frozen input, lock overlays, dropped WDAC policy — on the live system | ✅ **working** |
-| 1b | Offline WinPE rescue | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | planned |
+| **1b** | **Offline WinPE rescue** | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | ✅ **working** |
 | 2 | ASEP cleaner | Enumerate *all* autostart points (Run, services, drivers, tasks, WMI, IFEO, Winlogon) and quarantine unknown/unsigned entries — generic, not per-virus | planned |
-| 3 | Anti-ransomware guard | Honeypot canary files + directory watcher + entropy spike detection → suspend/kill the offending process tree; protect Shadow Copies from deletion | planned |
+| **3** | **Anti-ransomware guard** | Honeypot canary files + directory watcher + mass-change detection → suspend/kill the busiest writer's process tree | ✅ **working** |
 | 4 | Scanner | Integrate the **ClamAV** engine + scheduled scans; downloaded files (Mark-of-the-Web) get top-priority deep scan | planned |
 | 5 | Watchdog service | Paired self-protecting services that restart each other and the guard | planned |
 | 6 | Kernel minifilter driver | The "can't be killed" real-time tier (requires code-signing) | research |
@@ -98,13 +98,48 @@ and enables the full privilege set — the same documented token flow as ExecTI.
 4. If Rescue reported a WDAC policy it couldn't remove, use the offline WinPE
    rescue (Phase 1b) to delete it, then reboot.
 
+## Module 3 — Anti-Ransomware Guard
+
+A resident guard that reacts *while the attack is running*: it plants **canary**
+files, watches your folders in real time, and the instant something mass-modifies
+files (or touches a canary) it finds the busiest writer process and **suspends**
+its whole process tree — freezing the attack so you lose a handful of files
+instead of all of them.
+
+```
+ransom_guard                       watch Desktop/Documents/Pictures, SUSPEND on attack
+ransom_guard --watch D:\Work       watch a specific folder (repeatable)
+ransom_guard --threshold 25        files-changed-per-second that counts as an attack
+ransom_guard --kill                KILL the culprit instead of suspending (irreversible)
+```
+
+**Honest limitation:** from user mode Windows tells a watcher *that* files
+changed, not *which process* changed each one. Reliable per-write attribution
+needs a kernel minifilter driver (Phase 6). Until then the guard attributes the
+attack by ranking processes on write-I/O rate at the moment of the trip — a
+strong heuristic, not a certainty — so it **suspends** (reversible) by default
+and logs exactly what it acted on. Confirm in Task Manager before you `--kill`.
+It never touches OS-critical processes (a built-in whitelist).
+
+## Phase 1b — Offline WinPE rescue
+
+When the machine is locked so hard that even the live tools can't run — a
+Microsoft-signed / enforced WDAC policy blocking every `.exe`, a re-dropping
+dropper, a full-screen locker — clean it **offline** from a WinPE/WinRE boot USB,
+where the malware isn't running. See [`offline/`](offline/) for the scripts
+(`Rescue-Offline.ps1` and a bare-batch `rescue-offline.cmd`) and a full guide to
+building the USB and running them. Offline, a policy file is just a file — the
+signature can't stop you deleting it.
+
 ## Building
 
 ```bash
-make          # both architectures
-make x64      # -> build/x86_64/lockdown_breaker.exe   (mingw-w64 GCC)
-make arm64    # -> build/arm64/lockdown_breaker.exe     (llvm-mingw Clang)
+make          # both tools, both architectures
+make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard}.exe   (mingw-w64 GCC)
+make arm64    # -> build/arm64/{lockdown_breaker,ransom_guard}.exe     (llvm-mingw Clang)
 ```
+
+The offline rescue (`offline/`) is scripts — nothing to build.
 
 | Target | Toolchain |
 | --- | --- |

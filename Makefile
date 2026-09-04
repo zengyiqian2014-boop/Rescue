@@ -1,6 +1,6 @@
 # Rescue - cross-compile with MinGW for x86_64 and ARM64 Windows.
 #
-#   make            both architectures
+#   make            both tools, both architectures
 #   make x64        -> build/x86_64/*.exe   (mingw-w64 GCC)
 #   make arm64      -> build/arm64/*.exe     (llvm-mingw Clang)
 #   make clean
@@ -15,29 +15,32 @@ ARM64_WINDRES ?= aarch64-w64-mingw32-windres
 
 CXXFLAGS  = -O2 -std=c++17 -municode -Wall -Wextra \
             -static -static-libgcc -static-libstdc++
-# Console subsystem + libraries Rescue links against.
-LDFLAGS   = -Wl,--subsystem,console
+# Console subsystem + libraries Rescue links against. -pthread: ransom_guard
+# uses std::thread (winpthreads, linked statically by the flags above).
+LDFLAGS   = -Wl,--subsystem,console -pthread
 LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi
 
-SRC       = src/lockdown_breaker.cpp
-RC        = src/lockdown_breaker.rc
+# Tools: internal name -> is built for both arches.
+TOOLS     = lockdown_breaker ransom_guard
+
+X64_OUT   = $(patsubst %,build/x86_64/%.exe,$(TOOLS))
+ARM64_OUT = $(patsubst %,build/arm64/%.exe,$(TOOLS))
 
 .PHONY: all x64 arm64 clean
 all: x64 arm64
+x64:   $(X64_OUT)
+arm64: $(ARM64_OUT)
 
-x64: build/x86_64/lockdown_breaker.exe
-arm64: build/arm64/lockdown_breaker.exe
-
-build/x86_64/lockdown_breaker.exe: $(SRC) $(RC) src/privilege.h src/rescue.manifest
+build/x86_64/%.exe: src/%.cpp src/%.rc src/privilege.h src/rescue.manifest
 	@mkdir -p build/x86_64
-	$(X64_WINDRES) $(RC) -O coff -o build/x86_64/res.o
-	$(X64_CXX) $(CXXFLAGS) $(SRC) build/x86_64/res.o -o $@ $(LDFLAGS) $(LIBS)
+	$(X64_WINDRES) src/$*.rc -O coff -o build/x86_64/$*_res.o
+	$(X64_CXX) $(CXXFLAGS) $< build/x86_64/$*_res.o -o $@ $(LDFLAGS) $(LIBS)
 	@echo "built $@"
 
-build/arm64/lockdown_breaker.exe: $(SRC) $(RC) src/privilege.h src/rescue.manifest
+build/arm64/%.exe: src/%.cpp src/%.rc src/privilege.h src/rescue.manifest
 	@mkdir -p build/arm64
-	$(ARM64_WINDRES) $(RC) -O coff -o build/arm64/res.o
-	$(ARM64_CXX) $(CXXFLAGS) $(SRC) build/arm64/res.o -o $@ $(LDFLAGS) $(LIBS)
+	$(ARM64_WINDRES) src/$*.rc -O coff -o build/arm64/$*_res.o
+	$(ARM64_CXX) $(CXXFLAGS) $< build/arm64/$*_res.o -o $@ $(LDFLAGS) $(LIBS)
 	@echo "built $@"
 
 clean:
