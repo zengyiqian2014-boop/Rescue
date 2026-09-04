@@ -34,13 +34,13 @@ all: x64 arm64
 x64:   $(X64_OUT)
 arm64: $(ARM64_OUT)
 
-build/x86_64/%.exe: src/%.cpp src/%.rc src/privilege.h src/signature.h src/rescue.manifest
+build/x86_64/%.exe: src/%.cpp src/%.rc src/privilege.h src/signature.h src/etw_filemon.h src/rescue.manifest
 	@mkdir -p build/x86_64
 	$(X64_WINDRES) src/$*.rc -O coff -o build/x86_64/$*_res.o
 	$(X64_CXX) $(CXXFLAGS) $< build/x86_64/$*_res.o -o $@ $(LDFLAGS) $(LIBS)
 	@echo "built $@"
 
-build/arm64/%.exe: src/%.cpp src/%.rc src/privilege.h src/signature.h src/rescue.manifest
+build/arm64/%.exe: src/%.cpp src/%.rc src/privilege.h src/signature.h src/etw_filemon.h src/rescue.manifest
 	@mkdir -p build/arm64
 	$(ARM64_WINDRES) src/$*.rc -O coff -o build/arm64/$*_res.o
 	$(ARM64_CXX) $(CXXFLAGS) $< build/arm64/$*_res.o -o $@ $(LDFLAGS) $(LIBS)

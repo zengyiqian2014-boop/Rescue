@@ -7,13 +7,19 @@
 // - freezing the attack mid-run so you lose a handful of files instead of all
 // of them.
 //
-// HONEST LIMITATION (read this): from user mode you can see *that* files are
-// changing, but Windows does not tell a user-mode watcher *which process* wrote
-// each file. Reliable per-write attribution needs a kernel minifilter driver
-// (Rescue roadmap Phase 6). Until then this guard attributes the attack by
-// ranking processes on write-I/O rate at the moment of the trip - a strong
-// heuristic, not a certainty. It defaults to SUSPEND (reversible) rather than
-// kill, and always logs what it acted on so you can undo a wrong guess.
+// ATTRIBUTION - two tiers, picked automatically:
+//   * PREFERRED: a real-time ETW session on Microsoft-Windows-Kernel-File
+//     (etw_filemon.h) gives the requesting process id for every WRITE / RENAME
+//     / DELETE. That is DETERMINISTIC per-write attribution from user mode - no
+//     driver, Secure Boot and HVCI left on - so the guard freezes the process
+//     that actually did the writing, not a guess. Needs elevation.
+//   * FALLBACK: if the ETW session can't start, the guard ranks processes by
+//     write-I/O rate at the moment of the trip (IO_COUNTERS) - a strong
+//     heuristic, not a certainty, exactly as before.
+// The one thing ETW still cannot do is BLOCK a write before it lands; only an
+// in-kernel pre-write callback (Phase 6, signed driver) can. Attribution does
+// not need the kernel, and this is it. Defaults to SUSPEND (reversible) over
+// kill, and always logs what it acted on so a wrong guess can be undone.
 #include <windows.h>
 #include <tlhelp32.h>
 #include <cstdio>
@@ -26,6 +32,7 @@
 #include <chrono>
 #include <mutex>
 #include "privilege.h"
+#include "etw_filemon.h"
 
 using namespace std::chrono;
 
@@ -34,6 +41,7 @@ static std::atomic<bool> g_trip{false};
 static std::atomic<int>  g_recentEvents{0};
 static std::mutex        g_logMx;
 static bool g_kill = false;
+static etwmon::FileMonitor g_etw;   // deterministic attribution when it starts
 
 static void logline(const wchar_t* fmt, ...) {
     std::lock_guard<std::mutex> lk(g_logMx);
@@ -148,30 +156,56 @@ static void killProcess(DWORD pid) {
     if (h) { TerminateProcess(h, 1); CloseHandle(h); }
 }
 
+// Resolve a pid to its image name (for logging an ETW-attributed culprit).
+static std::wstring nameForPid(DWORD pid) {
+    for (auto& p : snapshotProcesses()) if (p.pid == pid) return p.name;
+    return L"(unknown)";
+}
+
+// pid-based protected check, for the ETW TopWriter exclude callback.
+static bool isProtectedPid(DWORD pid) {
+    return isProtected(lower(nameForPid(pid)));
+}
+
 // ---------------------------------------------------------------------------
 // the response: rank writers, neutralize the top culprit tree
 // ---------------------------------------------------------------------------
 static void respond(const wchar_t* reason) {
     logline(L"!!! RANSOMWARE SIGNAL: %ls", reason);
 
-    // Sample write-I/O over a short window to find who is writing hardest.
-    auto procs = snapshotProcesses();
-    std::map<DWORD, ULONGLONG> t0;
-    for (auto& p : procs)
-        if (!isProtected(lower(p.name))) t0[p.pid] = procWriteOps(p.pid);
-    std::this_thread::sleep_for(milliseconds(250));
     DWORD culprit = 0; ULONGLONG best = 0; std::wstring cname;
-    for (auto& p : procs) {
-        if (isProtected(lower(p.name))) continue;
-        ULONGLONG d = procWriteOps(p.pid) - t0[p.pid];
-        if (d > best) { best = d; culprit = p.pid; cname = p.name; }
+    const wchar_t* how = L"";
+
+    if (g_etw.Running()) {
+        // Deterministic: count actual per-process file WRITE/RENAME/DELETE
+        // events over a short window and take the process that did the most.
+        g_etw.Reset();
+        std::this_thread::sleep_for(milliseconds(250));
+        culprit = g_etw.TopWriter(&best, &isProtectedPid);
+        cname = culprit ? nameForPid(culprit) : L"";
+        how = L"file ops";
+    } else {
+        // Fallback: rank by write-I/O rate (heuristic, no ETW available).
+        auto procs = snapshotProcesses();
+        std::map<DWORD, ULONGLONG> t0;
+        for (auto& p : procs)
+            if (!isProtected(lower(p.name))) t0[p.pid] = procWriteOps(p.pid);
+        std::this_thread::sleep_for(milliseconds(250));
+        for (auto& p : procs) {
+            if (isProtected(lower(p.name))) continue;
+            ULONGLONG d = procWriteOps(p.pid) - t0[p.pid];
+            if (d > best) { best = d; culprit = p.pid; cname = p.name; }
+        }
+        how = L"write ops (heuristic)";
     }
+
     if (!culprit) { logline(L"    could not identify a writer process (no action taken)"); return; }
 
     std::vector<DWORD> tree;
     forEachDescendant(culprit, tree);
-    logline(L"    culprit (top writer): %ls  pid=%lu  (+%llu write ops in 250ms, %zu procs in tree)",
-            cname.c_str(), culprit, best, tree.size());
+    logline(L"    culprit (%ls): %ls  pid=%lu  (+%llu %ls in 250ms, %zu procs in tree)",
+            g_etw.Running() ? L"attributed" : L"top writer",
+            cname.c_str(), culprit, best, how, tree.size());
 
     for (DWORD pid : tree) {
         if (g_kill) killProcess(pid);
@@ -181,7 +215,10 @@ static void respond(const wchar_t* reason) {
             g_kill ? L"KILLED" : L"SUSPENDED (reversible)");
     if (!g_kill)
         logline(L"    Verify it in Task Manager. If correct: End task. If wrong: Resume it.");
-    logline(L"    (User-mode attribution is a heuristic - confirm before permanent action.)");
+    if (g_etw.Running())
+        logline(L"    (ETW attribution: this pid performed the file writes above.)");
+    else
+        logline(L"    (Heuristic attribution - confirm before permanent action.)");
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +312,15 @@ int wmain(int argc, wchar_t** argv) {
 
     priv::EnableDebugPrivilege();   // so we can suspend/kill other users' processes
 
+    // Try to bring up deterministic ETW attribution. If it can't start (not
+    // elevated, or ETW unavailable), the guard silently uses the heuristic.
+    bool etwOk = g_etw.Start();
+
     wprintf(L"=====================================================\n");
     wprintf(L"  Rescue - Anti-Ransomware Guard   %ls\n", g_kill ? L"[KILL mode]" : L"[SUSPEND mode]");
+    wprintf(L"  attribution: %ls\n",
+            etwOk ? L"ETW (deterministic - exact culprit process)"
+                  : L"heuristic (IO_COUNTERS - run elevated for ETW)");
     wprintf(L"=====================================================\n");
     for (auto& d : dirs) {
         plantCanaries(d);
@@ -289,5 +333,6 @@ int wmain(int argc, wchar_t** argv) {
     for (auto& d : dirs) pool.emplace_back(watchDir, d);
     pool.emplace_back(massChangeMonitor, threshold);
     for (auto& t : pool) t.join();
+    g_etw.Stop();
     return 0;
 }

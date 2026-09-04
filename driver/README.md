@@ -8,6 +8,16 @@ turns "the busiest writer is *probably* the culprit" into **certain per-write
 attribution**, and, running as a boot-start driver, it is far harder for malware
 to kill than a user-mode process.
 
+> **What still needs this driver, after the ETW work in Module 3:** only
+> *blocking a write before it lands*. Deterministic **attribution** — knowing
+> which process performed each write/rename/delete — is now done from user mode
+> via a real-time ETW session on `Microsoft-Windows-Kernel-File`
+> ([`../src/etw_filemon.h`](../src/etw_filemon.h)), with Secure Boot and HVCI
+> left on and no signing required. The minifilter's remaining unique capability
+> is the **pre-operation callback** that can return `STATUS_ACCESS_DENIED` and
+> stop a malicious write in the I/O path — something ETW, which reports events
+> after the fact, structurally cannot do.
+
 ## Why it's separate from the Makefile
 
 This is **WDK / MSVC code — it cannot be built with MinGW.** Kernel drivers use

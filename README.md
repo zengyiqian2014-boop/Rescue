@@ -51,7 +51,7 @@ that work:
 | **1** | **Lockdown Breaker** | Undo restriction policies, shell hijack, frozen input, lock overlays, dropped WDAC policy — on the live system | ✅ **working** |
 | **1b** | **Offline WinPE rescue** | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | ✅ **working** |
 | **2** | **ASEP Cleaner** | Enumerate *all* autostart points (Run, services, tasks, IFEO, Winlogon, startup) and flag/quarantine unsigned entries — Authenticode-verified, generic, not per-virus | ✅ **working** |
-| **3** | **Anti-ransomware guard** | Honeypot canary files + directory watcher + mass-change detection → suspend/kill the busiest writer's process tree | ✅ **working** |
+| **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's process tree; **ETW gives deterministic per-process attribution** (no driver), heuristic fallback | ✅ **working** |
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
 | **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
@@ -113,13 +113,23 @@ ransom_guard --threshold 25        files-changed-per-second that counts as an at
 ransom_guard --kill                KILL the culprit instead of suspending (irreversible)
 ```
 
-**Honest limitation:** from user mode Windows tells a watcher *that* files
-changed, not *which process* changed each one. Reliable per-write attribution
-needs a kernel minifilter driver (Phase 6). Until then the guard attributes the
-attack by ranking processes on write-I/O rate at the moment of the trip — a
-strong heuristic, not a certainty — so it **suspends** (reversible) by default
-and logs exactly what it acted on. Confirm in Task Manager before you `--kill`.
-It never touches OS-critical processes (a built-in whitelist).
+**Attribution — deterministic, without a driver.** `ReadDirectoryChangesW`
+tells a watcher *that* files changed, not *which process* changed them. Rescue
+gets the missing half from a real-time **ETW** session on the
+`Microsoft-Windows-Kernel-File` provider, whose WRITE / RENAME / DELETE events
+each carry the requesting **process id**. So when the guard trips it counts the
+actual file-modifying operations per process over a short window and freezes the
+one that did them — the *exact* culprit, not a guess — with **Secure Boot and
+Memory Integrity left fully on** and no kernel driver. It needs elevation (a
+real-time ETW session does); if the session can't start it falls back to ranking
+processes by write-I/O rate (the previous heuristic), and the banner says which
+tier is live.
+
+The one thing ETW still cannot do is **block** a write before it lands — only an
+in-kernel pre-write callback (Phase 6, signed driver) can. Attribution does not
+need the kernel, and this is it. The guard **suspends** (reversible) by default,
+logs exactly what it acted on, and never touches OS-critical processes (a
+built-in whitelist).
 
 ## Module 2 — ASEP Cleaner
 
