@@ -50,7 +50,7 @@ that work:
 | --- | --- | --- | --- |
 | **1** | **Lockdown Breaker** | Undo restriction policies, shell hijack, frozen input, lock overlays, dropped WDAC policy — on the live system | ✅ **working** |
 | **1b** | **Offline WinPE rescue** | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | ✅ **working** |
-| 2 | ASEP cleaner | Enumerate *all* autostart points (Run, services, drivers, tasks, WMI, IFEO, Winlogon) and quarantine unknown/unsigned entries — generic, not per-virus | planned |
+| **2** | **ASEP Cleaner** | Enumerate *all* autostart points (Run, services, tasks, IFEO, Winlogon, startup) and flag/quarantine unsigned entries — Authenticode-verified, generic, not per-virus | ✅ **working** |
 | **3** | **Anti-ransomware guard** | Honeypot canary files + directory watcher + mass-change detection → suspend/kill the busiest writer's process tree | ✅ **working** |
 | 4 | Scanner | Integrate the **ClamAV** engine + scheduled scans; downloaded files (Mark-of-the-Web) get top-priority deep scan | planned |
 | 5 | Watchdog service | Paired self-protecting services that restart each other and the guard | planned |
@@ -121,6 +121,32 @@ strong heuristic, not a certainty — so it **suspends** (reversible) by default
 and logs exactly what it acted on. Confirm in Task Manager before you `--kill`.
 It never touches OS-critical processes (a built-in whitelist).
 
+## Module 2 — ASEP Cleaner
+
+Malware can be anything, but to survive a reboot it has to anchor itself to one
+of a finite set of **Auto-Start Extensibility Points**. This walks all of them,
+**verifies each program's Authenticode signature — embedded *and* catalog** — and
+flags whatever is unsigned, untrusted, or points at a missing file. That catches
+brand-new malware nobody has a signature for yet, **without a virus database**.
+
+```
+asep_cleaner                 scan & REPORT flagged autostarts (changes nothing)
+asep_cleaner --quarantine    neutralize flagged entries (backs up first)
+```
+
+It covers **Run/RunOnce** (HKLM, HKCU, every loaded user hive, WOW64),
+**Winlogon** Shell/Userinit, **Image File Execution Options** debugger hijacks,
+**startup folders**, **auto-start services**, and **scheduled tasks**. Bare names
+(e.g. `Shell = explorer.exe`) are resolved via the OS search path before
+verifying, so legitimate system entries aren't falsely flagged. Catalog
+verification is why it doesn't scream "unsigned!" at half of System32 — most
+Windows binaries are catalog-signed, and it checks the catalogs.
+
+`--quarantine` backs up registry values to `HKLM\SOFTWARE\RescueQuarantine`
+before removing them, renames flagged startup files (never deletes), and sets
+flagged services to *Disabled*. Scheduled tasks are reported, not touched. A
+flag means *unsigned*, not *definitely malicious* — review before quarantining.
+
 ## Phase 1b — Offline WinPE rescue
 
 When the machine is locked so hard that even the live tools can't run — a
@@ -135,8 +161,8 @@ signature can't stop you deleting it.
 
 ```bash
 make          # both tools, both architectures
-make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard}.exe   (mingw-w64 GCC)
-make arm64    # -> build/arm64/{lockdown_breaker,ransom_guard}.exe     (llvm-mingw Clang)
+make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard,asep_cleaner}.exe
+make arm64    # -> build/arm64/{lockdown_breaker,ransom_guard,asep_cleaner}.exe
 ```
 
 The offline rescue (`offline/`) is scripts — nothing to build.

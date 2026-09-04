@@ -18,10 +18,12 @@ CXXFLAGS  = -O2 -std=c++17 -municode -Wall -Wextra \
 # Console subsystem + libraries Rescue links against. -pthread: ransom_guard
 # uses std::thread (winpthreads, linked statically by the flags above).
 LDFLAGS   = -Wl,--subsystem,console -pthread
-LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi
+# -lwintrust -lcrypt32: Authenticode verification in asep_cleaner (signature.h).
+# mingw ignores #pragma comment(lib), so the libs must be listed here.
+LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi -lwintrust -lcrypt32
 
 # Tools: internal name -> is built for both arches.
-TOOLS     = lockdown_breaker ransom_guard
+TOOLS     = lockdown_breaker ransom_guard asep_cleaner
 
 X64_OUT   = $(patsubst %,build/x86_64/%.exe,$(TOOLS))
 ARM64_OUT = $(patsubst %,build/arm64/%.exe,$(TOOLS))
