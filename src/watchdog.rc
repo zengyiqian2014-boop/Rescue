@@ -1,0 +1,29 @@
+#include <winver.h>
+
+// UAC manifest (requireAdministrator) - install/uninstall need elevation.
+1 24 "rescue.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,5,0,0
+ PRODUCTVERSION 0,5,0,0
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName",      "Open Source"
+      VALUE "FileDescription",  "Rescue - Watchdog (keeps the guard alive)"
+      VALUE "FileVersion",      "0.5.0.0"
+      VALUE "InternalName",     "watchdog"
+      VALUE "OriginalFilename", "watchdog.exe"
+      VALUE "ProductName",      "Rescue"
+      VALUE "ProductVersion",   "0.5.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

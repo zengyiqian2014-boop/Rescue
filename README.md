@@ -53,8 +53,8 @@ that work:
 | **2** | **ASEP Cleaner** | Enumerate *all* autostart points (Run, services, tasks, IFEO, Winlogon, startup) and flag/quarantine unsigned entries — Authenticode-verified, generic, not per-virus | ✅ **working** |
 | **3** | **Anti-ransomware guard** | Honeypot canary files + directory watcher + mass-change detection → suspend/kill the busiest writer's process tree | ✅ **working** |
 | 4 | Scanner | Integrate the **ClamAV** engine + scheduled scans; downloaded files (Mark-of-the-Web) get top-priority deep scan | planned |
-| 5 | Watchdog service | Paired self-protecting services that restart each other and the guard | planned |
-| 6 | Kernel minifilter driver | The "can't be killed" real-time tier (requires code-signing) | research |
+| **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
+| **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete; needs WDK build + signing | 🧩 **source** |
 
 ## Module 1 — Lockdown Breaker
 
@@ -147,6 +147,40 @@ before removing them, renames flagged startup files (never deletes), and sets
 flagged services to *Disabled*. Scheduled tasks are reported, not touched. A
 flag means *unsigned*, not *definitely malicious* — review before quarantining.
 
+## Module 5 — Watchdog
+
+A protection tool a malicious process can just kill is no protection. This is a
+Windows service (`RescueWatchdog`) that keeps **Ransom Guard** running and runs a
+**paired companion** process: the service watches the companion, the companion
+watches the service, and killing either one makes the other bring it back. The
+service is also set to auto-restart on crash.
+
+```
+watchdog --install     install + start the service (run elevated)
+watchdog --uninstall   stop + remove the service
+watchdog --status      show service + guard state
+```
+
+**Honest ceiling:** two cooperating user-mode processes raise the bar — an
+attacker has to kill both in the same instant, repeatedly — but a
+privileged attacker can still win the race. Truly tamper-proof protection needs
+a Protected-Process-Light service or the kernel filter below. The tool says so.
+
+## Module 6 — Kernel minifilter (source)
+
+The **un-killable real-time tier**. Everything in user mode is a heuristic
+because Windows won't tell a user-mode watcher *which* process wrote a file — a
+kernel **minifilter** in the I/O path gets exactly that (`FltGetRequestorProcessId`
+in a pre-write callback), turning "probably the culprit" into **certain per-write
+attribution**. It reports attributed WRITE/RENAME/DELETE events to the Rescue
+service over a filter communication port.
+
+The full, reviewable driver source, its INF, and a build/signing guide are in
+[`driver/`](driver/). **It is WDK/MSVC code — it can't be built with MinGW and is
+excluded from `make`.** Loading it requires a signed driver (test-signing for
+dev; an EV cert + Microsoft attestation for release). This is the one tier that
+can't be a cross-compiled `.exe`, and the README is explicit about why.
+
 ## Phase 1b — Offline WinPE rescue
 
 When the machine is locked so hard that even the live tools can't run — a
@@ -161,8 +195,8 @@ signature can't stop you deleting it.
 
 ```bash
 make          # both tools, both architectures
-make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard,asep_cleaner}.exe
-make arm64    # -> build/arm64/{lockdown_breaker,ransom_guard,asep_cleaner}.exe
+make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard,asep_cleaner,watchdog}.exe
+make arm64    # -> build/arm64/{...}.exe    (llvm-mingw Clang)
 ```
 
 The offline rescue (`offline/`) is scripts — nothing to build.

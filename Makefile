@@ -23,7 +23,7 @@ LDFLAGS   = -Wl,--subsystem,console -pthread
 LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi -lwintrust -lcrypt32
 
 # Tools: internal name -> is built for both arches.
-TOOLS     = lockdown_breaker ransom_guard asep_cleaner
+TOOLS     = lockdown_breaker ransom_guard asep_cleaner watchdog
 
 X64_OUT   = $(patsubst %,build/x86_64/%.exe,$(TOOLS))
 ARM64_OUT = $(patsubst %,build/arm64/%.exe,$(TOOLS))
