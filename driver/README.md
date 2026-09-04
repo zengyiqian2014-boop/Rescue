@@ -45,25 +45,38 @@ false positive can't brick the machine.
    ```
    Output: `rescuemon.sys`.
 
-## Loading it (signing is mandatory)
+## Loading it (signing is mandatory, and self-signing is not enough)
 
-64-bit Windows will not load an unsigned kernel driver.
+64-bit Windows will not load an unsigned kernel driver — and, importantly, it
+will not load a **self-signed** one either, no matter what the user agrees to.
 
-- **Development / your own machine:** enable test-signing, make a test cert,
-  sign the `.sys`, then load with the Filter Manager:
+Kernel Code Integrity **does not consult the machine's certificate stores**.
+That is the part that surprises people: in user mode, trusting a root makes code
+signed by it validate; in kernel mode the loader makes a stricter, separate
+check before any user context exists. Since **Windows 10 1607** a new kernel
+driver loads only when **Microsoft** signed it, and the **April 2026 Windows
+update** removed default trust for the old cross-signed program as well. So
+there is no "install our certificate during setup" flow that makes this driver
+load. See [`../installer/README.md`](../installer/README.md) for the full
+reasoning and the two paths that do work:
+
+- **Release / other people's machines — the only real path:** an **EV
+  code-signing certificate** plus **Microsoft Partner Center attestation
+  signing** (or full WHCP). The driver comes back signed by Microsoft and loads
+  with Secure Boot on, with nothing for the user to accept.
+- **Development / your own machine:** test-signing mode, which requires
+  **Secure Boot off** and lowers the bar for every driver on that machine, not
+  just this one. `installer/Install-RescueDriver.ps1 -LabMode` does this with
+  itemised, typed consent and a precise revert:
+  ```powershell
+  .\Install-RescueDriver.ps1 -LabMode     # preflight, consent, sign, trust, load
+  .\Uninstall-RescueDriver.ps1            # undoes exactly what it changed
   ```
-  bcdedit /set testsigning on              :: then reboot
-  makecert / signtool sign /v /s PrivateCertStore /n RescueTest rescuemon.sys
-  copy rescuemon.sys %windir%\System32\drivers\
-  sc create RescueMon type= filesys binPath= System32\drivers\rescuemon.sys start= demand
-  fltmc load RescueMon
-  ```
-  (Or right-click `rescuemon.inf` → Install, then `fltmc load RescueMon`.)
-- **Release / other people's machines:** you need an **EV code-signing
-  certificate** and to submit the driver to the **Microsoft Partner Center**
-  for **attestation signing** (or full WHQL). There is no way around this — it's
-  the same gate that made the ExecTI SmartScreen story what it was, and for
-  kernel code it is absolute.
+
+Also worth knowing before the first load attempt: **Memory Integrity (HVCI)** is
+on by default on much current hardware and will block a driver that is not
+HVCI-compatible *even when it is correctly signed*. The installer reports its
+state up front so a silent failure has an explanation.
 
 ## Altitude
 
@@ -78,4 +91,6 @@ This is the scaffold of the un-killable tier: registration, the communication
 port, and attributed WRITE/RENAME/DELETE reporting are all real and correct.
 It is not yet a signed, shipping driver — that requires the WDK build and the
 signing gate above, neither of which can happen in the MinGW cross-build that
-produces the rest of Rescue.
+produces the rest of Rescue. The installer scripts in
+[`../installer/`](../installer/) are written and parse-checked but have not been
+run on Windows; the first run on a real test machine is what validates them.

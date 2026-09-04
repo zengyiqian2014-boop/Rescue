@@ -54,7 +54,7 @@ that work:
 | **3** | **Anti-ransomware guard** | Honeypot canary files + directory watcher + mass-change detection → suspend/kill the busiest writer's process tree | ✅ **working** |
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
-| **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete; needs WDK build + signing | 🧩 **source** |
+| **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
 
 ## Module 1 — Lockdown Breaker
 
@@ -232,10 +232,17 @@ attribution**. It reports attributed WRITE/RENAME/DELETE events to the Rescue
 service over a filter communication port.
 
 The full, reviewable driver source, its INF, and a build/signing guide are in
-[`driver/`](driver/). **It is WDK/MSVC code — it can't be built with MinGW and is
-excluded from `make`.** Loading it requires a signed driver (test-signing for
-dev; an EV cert + Microsoft attestation for release). This is the one tier that
-can't be a cross-compiled `.exe`, and the README is explicit about why.
+[`driver/`](driver/); the install/revert scripts are in
+[`installer/`](installer/). **It is WDK/MSVC code — it can't be built with MinGW and is
+excluded from `make`.** Loading it requires a signed driver, and **self-signing does not help**:
+kernel Code Integrity does not consult the machine's certificate stores, so no
+"accept our certificate during setup" flow will make it load. The only path to
+other people's machines is an **EV certificate + Microsoft attestation
+signing**; test-signing mode is a developer-only facility that requires Secure
+Boot off. [`installer/`](installer/) implements both paths — the production one
+changes nothing about the machine, and the lab one takes itemised typed consent
+and reverts exactly what it changed. This is the one tier that can't be a
+cross-compiled `.exe`, and the docs are explicit about why.
 
 ## Phase 1b — Offline WinPE rescue
 
