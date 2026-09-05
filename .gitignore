@@ -2,3 +2,4 @@ build/
 *.o
 *.obj
 *.exe
+dist/
