@@ -134,11 +134,15 @@ tier is live.
 directory watcher sees. A **wiper** often skips the filesystem entirely, opening
 the raw disk (`\\.\PhysicalDrive0`) and streaming zeros to sectors — producing
 no file-change events at all. So a second monitor watches each process's raw
-write-**byte** rate and trips when one non-whitelisted process sustains a very
-high rate (`--wiper-mbps`, default 150 MB/s), freezing it. A full zero-fill is
-slow and loud; catching it mid-run turns "whole disk gone" into "a fraction
-lost". Data that was already overwritten is gone regardless — only the offline
-backup (Module 7) survives that.
+write-**byte** rate and trips when a process sustains a very high rate
+(`--wiper-mbps`, default 150 MB/s). But a legitimate disk imager (Rufus,
+Win32DiskImager, `dd`, a USB writer) writes to a raw disk *exactly* like a wiper
+does — so the rate alone isn't enough. The discriminator is **trust**: a signed
+disk tool is exempt; only an **unsigned/untrusted** high-rate writer is frozen
+(and suspend is reversible, so a rare wrong guess is undoable). A full zero-fill
+is slow and loud; catching it mid-run turns "whole disk gone" into "a fraction
+lost". Data already overwritten is gone regardless — only the offline backup
+(Module 7) survives that.
 
 The one thing ETW still cannot do is **block** a write before it lands — only an
 in-kernel pre-write callback (Phase 6, signed driver) can. Attribution does not

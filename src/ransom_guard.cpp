@@ -33,6 +33,7 @@
 #include <mutex>
 #include "privilege.h"
 #include "etw_filemon.h"
+#include "signature.h"
 
 using namespace std::chrono;
 
@@ -119,6 +120,17 @@ static ULONGLONG procWriteOps(DWORD pid) {
     if (GetProcessIoCounters(h, &io)) v = io.WriteOperationCount + io.OtherOperationCount;
     CloseHandle(h);
     return v;
+}
+
+// Full image path for a pid (for signature checks on a suspected wiper).
+static std::wstring imagePathForPid(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return L"";
+    wchar_t buf[MAX_PATH * 2]; DWORD n = MAX_PATH * 2;
+    std::wstring path;
+    if (QueryFullProcessImageNameW(h, 0, buf, &n)) path.assign(buf, n);
+    CloseHandle(h);
+    return path;
 }
 
 // Bytes written by a process. A ransomware encrypts files (file-system writes,
@@ -297,11 +309,26 @@ static void rawWriteMonitor(int mbPerSec) {
             if (d > worstRate) { worstRate = d; worst = p.pid; wname = p.name; }
         }
         prev.swap(cur);
-        if (worst && worstRate >= budget && !g_trip.exchange(true)) {
-            wchar_t r[192];
-            swprintf(r, 192, L"%ls (pid %lu) is writing %.0f MB/s - possible disk wiper",
-                     wname.c_str(), worst, (double)worstRate / (1024.0 * 1024.0));
-            respond(r);
+        if (worst && worstRate >= budget) {
+            // A legitimate disk imager (Rufus, Win32DiskImager, dd, etc.) writes
+            // to a raw disk exactly like a wiper does - the ONLY cheap way to
+            // tell them apart from user mode is trust: signed disk tools are
+            // exempt; only an UNSIGNED/untrusted high-rate writer trips. Suspend
+            // is reversible anyway, so a rare wrong guess is undoable.
+            std::wstring img = imagePathForPid(worst);
+            sig::Trust t = img.empty() ? sig::Trust::Unsigned : sig::Verify(img);
+            if (!sig::IsTrusted(t) && !g_trip.exchange(true)) {
+                wchar_t r[224];
+                swprintf(r, 224, L"UNSIGNED %ls (pid %lu) writing %.0f MB/s to disk - possible wiper",
+                         wname.c_str(), worst, (double)worstRate / (1024.0 * 1024.0));
+                respond(r);
+            } else if (sig::IsTrusted(t)) {
+                // Note a signed high-rate writer once per process, not every second.
+                static std::set<DWORD> noted;
+                if (noted.insert(worst).second)
+                    logline(L"[i] %ls (pid %lu) is writing fast but is signed (%ls) - allowed (disk tool).",
+                            wname.c_str(), worst, sig::TrustName(t));
+            }
         }
         if (g_trip) { std::this_thread::sleep_for(seconds(2)); g_trip = false; }
     }
