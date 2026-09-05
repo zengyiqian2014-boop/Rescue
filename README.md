@@ -156,13 +156,22 @@ raw-disk attacker (an MBR overwriter like MEMZ, a zero-fill wiper) must open
 with write-sharing denied (`FILE_SHARE_READ` only) and holds the handle, every
 later attempt to open it for write fails with a sharing violation — so the
 attacker never gets its write handle. That stops the overwrite *before* it
-happens, from user mode, no signing. It is best-effort and has real costs: if
-another component already holds the device with write access the restrictive
-open fails, and while the shield is up a *legitimate* disk tool is blocked too
-(stop the guard to use one). The live **system volume** still can't be locked
-outright (`FSCTL_LOCK_VOLUME` fails on it because the registry/pagefile keep
-handles open) — but shielding the raw *PhysicalDrive* handle covers the MBR/GPT
-and raw-sector vector that lock wouldn't anyway.
+happens, from user mode, no signing. The shield covers **both** the physical drives *and* each fixed volume device
+(`\\.\C:` …), which closes a second trick: `FSCTL_DISMOUNT_VOLUME` can force a
+mounted volume off even with files open, and its purpose is to make the volume's
+sectors raw-writable afterwards. We can't stop the dismount call itself from
+user mode (that needs the kernel filter), but holding the volume device with
+write-sharing denied means the attacker still can't get a write handle to those
+sectors *after* dismounting — so the dismount buys them nothing. Holding the
+volume handle does not block normal file I/O (that goes through the mounted
+filesystem, not the raw volume handle), so it's safe on the live system volume.
+
+It is best-effort and has real costs: if another component already holds a
+device with write access the restrictive open fails, and while the shield is up
+a *legitimate* disk tool is blocked too (stop the guard to use one). The live
+system volume still can't be `FSCTL_LOCK_VOLUME`'d outright (the registry/
+pagefile keep handles open) — but the raw-device shields cover the MBR/GPT and
+raw-sector vectors a volume lock wouldn't anyway.
 
 **What still needs the kernel (Module 6):** telling *which sectors* a write
 targets (to allow a legit write to a data region but block one to the MBR-GPT

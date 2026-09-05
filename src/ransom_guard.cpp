@@ -407,8 +407,33 @@ static void acquireDiskShield() {
             ++shielded;
         }
     }
-    if (!shielded)
-        logline(L"[!] disk shield: could not hold any PhysicalDrive exclusively "
+    // Also shield each fixed VOLUME device (\\.\C: ...). This closes the
+    // "dismount then raw-write" path: FSCTL_DISMOUNT_VOLUME can force a mounted
+    // volume off even with open handles (so we can't stop the dismount itself
+    // from user mode - that needs the kernel filter), but its PURPOSE is to
+    // make the volume's sectors raw-writable afterwards. Holding the volume
+    // device with write-sharing denied means the attacker still can't get a
+    // write handle to those sectors after dismounting. This does NOT block
+    // normal file I/O (that goes through the mounted filesystem, not the raw
+    // volume handle), so it is safe to hold on the live system volume.
+    int volShielded = 0;
+    wchar_t drives[256]{};
+    DWORD n = GetLogicalDriveStringsW(255, drives);
+    for (wchar_t* d = drives; d < drives + n && *d; d += wcslen(d) + 1) {
+        if (GetDriveTypeW(d) != DRIVE_FIXED) continue;
+        wchar_t vol[16];
+        swprintf(vol, 16, L"\\\\.\\%c:", d[0]);
+        HANDLE h = CreateFileW(vol, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            g_shieldHandles.push_back(h);
+            logline(L"disk shield: holding %ls (blocks raw-write after a forced dismount)", vol);
+            ++volShielded;
+        }
+    }
+
+    if (!shielded && !volShielded)
+        logline(L"[!] disk shield: could not hold any raw device exclusively "
                 L"(another component may already have write access). Detection still active.");
 }
 
@@ -436,9 +461,10 @@ static void usage() {
         L"  --wiper-mbps <n>  raw write-rate (MB/s) from one process that counts as a\n"
         L"                    disk wiper - catches raw-disk zero-fillers the file\n"
         L"                    watcher can't see (default 150)\n"
-        L"  --shield          PREVENT raw-disk overwrite: hold \\\\.\\PhysicalDriveN with\n"
-        L"                    write-sharing denied, so a wiper/MBR-overwriter can't get\n"
-        L"                    a write handle. Blocks legit disk tools too while active.\n"
+        L"  --shield          PREVENT raw-disk overwrite: hold each \\\\.\\PhysicalDriveN\n"
+        L"                    and \\\\.\\<vol> with write-sharing denied, so a wiper /\n"
+        L"                    MBR-overwriter can't get a write handle - even after a\n"
+        L"                    forced dismount. Blocks legit disk tools too while active.\n"
         L"  --kill            KILL the culprit instead of suspending it (irreversible)\n"
         L"  -h, --help        this help\n\n"
         L"Leave it running. On a trip it suspends the busiest writer's process tree\n"
