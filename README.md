@@ -10,6 +10,25 @@ Cross-compiled with **MinGW** for both **x86_64** and **ARM64** Windows.
 > some of that goal has hard technical limits, and this README is straight with
 > you about them.
 
+## The app
+
+Rescue is now **one application**, not a set of commands. Launch **`Rescue.cmd`**
+(or `rescue_gui.exe`) and you get a single window that approves itself through
+UAC and drives every engine from big buttons:
+
+- **Quick Scan / Full Scan** — the heuristic + hash scanner, results streamed live
+- **Turn Protection ON/OFF** — starts the real-time anti-ransomware guard (with
+  the raw-disk write shield) in the background; the status bar shows green
+  *Protected* / red *Not protected* at a glance
+- **Unlock / Clean** — undo a malware lockdown and kill screen-takeover effects
+- **Back Up My Files** — pick a disk, take a Time Machine-style snapshot
+- **Quarantine** — open what the scanner set aside
+
+The command-line engines below still exist (the GUI runs them under the hood, and
+they're handy for scripting/automation), but a normal user never has to touch
+them.
+
+
 ---
 
 ## Why this exists

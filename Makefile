@@ -23,16 +23,34 @@ LDFLAGS   = -Wl,--subsystem,console -pthread
 # mingw ignores #pragma comment(lib), so the libs must be listed here.
 LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi -lwintrust -lcrypt32 -lbcrypt
 
-# Tools: internal name -> is built for both arches.
+# The GUI app (rescue_gui) is a windowed program: WINDOWS subsystem instead of
+# console, plus common controls / shell / COM for the dashboard and folder picker.
+GUI_LDFLAGS = -Wl,--subsystem,windows -pthread
+GUI_LIBS    = $(LIBS) -lcomctl32 -lshell32 -lole32 -lgdi32
+
+# Console engines, built for both arches.
 TOOLS     = lockdown_breaker ransom_guard asep_cleaner watchdog scanner backup
 
-X64_OUT   = $(patsubst %,build/x86_64/%.exe,$(TOOLS))
-ARM64_OUT = $(patsubst %,build/arm64/%.exe,$(TOOLS))
+X64_OUT   = $(patsubst %,build/x86_64/%.exe,$(TOOLS)) build/x86_64/rescue_gui.exe
+ARM64_OUT = $(patsubst %,build/arm64/%.exe,$(TOOLS)) build/arm64/rescue_gui.exe
 
 .PHONY: all x64 arm64 clean
 all: x64 arm64
 x64:   $(X64_OUT)
 arm64: $(ARM64_OUT)
+
+# Explicit GUI rules (override the console pattern rule below).
+build/x86_64/rescue_gui.exe: src/rescue_gui.cpp src/rescue_gui.rc src/rescue.manifest
+	@mkdir -p build/x86_64
+	$(X64_WINDRES) src/rescue_gui.rc -O coff -o build/x86_64/rescue_gui_res.o
+	$(X64_CXX) $(CXXFLAGS) $< build/x86_64/rescue_gui_res.o -o $@ $(GUI_LDFLAGS) $(GUI_LIBS)
+	@echo "built $@"
+
+build/arm64/rescue_gui.exe: src/rescue_gui.cpp src/rescue_gui.rc src/rescue.manifest
+	@mkdir -p build/arm64
+	$(ARM64_WINDRES) src/rescue_gui.rc -O coff -o build/arm64/rescue_gui_res.o
+	$(ARM64_CXX) $(CXXFLAGS) $< build/arm64/rescue_gui_res.o -o $@ $(GUI_LDFLAGS) $(GUI_LIBS)
+	@echo "built $@"
 
 build/x86_64/%.exe: src/%.cpp src/%.rc src/privilege.h src/signature.h src/etw_filemon.h src/rescue.manifest
 	@mkdir -p build/x86_64
