@@ -350,6 +350,18 @@ levels:
   Windows' built-in **`wbadmin`** (free, no signing), so recovery restores the
   machine to its previous state, **bootable and ready to use**. Recover it from
   Windows install media → *System Image Recovery*.
+- **`-Mode oneclick`** — combines an **official Windows ISO** (your machine
+  downloads it from Microsoft — Windows is never bundled or redistributed here)
+  with your newest `.rbk` and a Microsoft-supported **`autounattend.xml`** answer
+  file, so booting the stick runs Windows Setup, skips the OOBE nag screens, and
+  **auto-restores your data, settings and personalization on first logon**. It is
+  *near*-one-click on purpose: you still confirm which disk and edition in Setup,
+  because an answer file that silently wipes a disk is dangerous. **Applications
+  are not restored** (licensed separately — the backup keeps a program list to
+  reinstall from), and **activation is not handled**: no key is written unless you
+  pass your own `-ProductKey`, and the script contains no activation logic of any
+  kind. If you don't pass `-Iso`, it points you at Microsoft's official download
+  and fetches the official Media Creation Tool rather than shipping Windows.
 
 Which to use: the `.rbk` snapshots restore *your files and settings* onto a
 clean or existing Windows (apps must be reinstalled — that's why the backup
