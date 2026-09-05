@@ -283,6 +283,90 @@ static void watchDir(std::wstring dir) {
     CloseHandle(h);
 }
 
+// ---------------------------------------------------------------------------
+// critical-sector tripwire: watch the spots a boot-killer / partition-wiper hits
+// ---------------------------------------------------------------------------
+// A surgical attack (MEMZ overwriting the MBR, a tool zeroing the GPT header or
+// a volume boot record) writes only a few hundred bytes - far below the byte-
+// RATE monitor's radar. But those bytes sit in a tiny, fixed, high-value set of
+// sectors, and they should not change except during a deliberate partition
+// operation. So we snapshot those exact sectors at startup and poll them: if one
+// changes, something is rewriting a critical structure - alarm and respond.
+//
+// This is READ-ONLY: it monitors the real MBR/GPT/VBR rather than writing decoy
+// bytes (which would risk corrupting data and wouldn't slow an attacker anyway).
+// It is detection with a short poll-window race, complementing --shield
+// (prevention) and the rate monitor (bulk wipes).
+struct SectorWatch { std::wstring dev; LONGLONG off; std::wstring label; std::vector<BYTE> base; };
+
+static bool readSector(const std::wstring& dev, LONGLONG off, std::vector<BYTE>& out) {
+    HANDLE h = CreateFileW(dev.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER li; li.QuadPart = off;
+    bool ok = false;
+    if (SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) {
+        out.resize(512);
+        DWORD got = 0;
+        ok = ReadFile(h, out.data(), 512, &got, nullptr) && got == 512;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+static void criticalSectorMonitor() {
+    std::vector<SectorWatch> watches;
+    // MBR (LBA0) and GPT primary header (LBA1) of each physical drive.
+    for (int i = 0; i < 16; ++i) {
+        wchar_t dev[64]; swprintf(dev, 64, L"\\\\.\\PhysicalDrive%d", i);
+        std::vector<BYTE> b;
+        if (readSector(dev, 0, b)) {
+            wchar_t lbl[80]; swprintf(lbl, 80, L"PhysicalDrive%d MBR (sector 0)", i);
+            watches.push_back({dev, 0, lbl, b});
+            std::vector<BYTE> g;
+            if (readSector(dev, 512, g)) {
+                wchar_t lg[80]; swprintf(lg, 80, L"PhysicalDrive%d GPT header (sector 1)", i);
+                watches.push_back({dev, 512, lg, g});
+            }
+        }
+    }
+    // Volume boot record (sector 0) of each fixed volume.
+    wchar_t drives[256]{}; DWORD n = GetLogicalDriveStringsW(255, drives);
+    for (wchar_t* d = drives; d < drives + n && *d; d += wcslen(d) + 1) {
+        if (GetDriveTypeW(d) != DRIVE_FIXED) continue;
+        wchar_t vol[16]; swprintf(vol, 16, L"\\\\.\\%c:", d[0]);
+        std::vector<BYTE> b;
+        if (readSector(vol, 0, b)) {
+            wchar_t lbl[48]; swprintf(lbl, 48, L"%c: volume boot record", d[0]);
+            watches.push_back({vol, 0, lbl, b});
+        }
+    }
+    if (watches.empty()) {
+        logline(L"[i] critical-sector tripwire: no raw sectors readable (need elevation) - skipped.");
+        return;
+    }
+    logline(L"critical-sector tripwire: watching %zu boot/partition structures", watches.size());
+
+    for (;;) {
+        std::this_thread::sleep_for(seconds(3));
+        for (auto& w : watches) {
+            std::vector<BYTE> cur;
+            if (!readSector(w.dev, w.off, cur)) continue;
+            if (cur != w.base) {
+                if (!g_trip.exchange(true)) {
+                    wchar_t r[160];
+                    swprintf(r, 160, L"CRITICAL STRUCTURE CHANGED: %ls - boot/partition tamper",
+                             w.label.c_str());
+                    respond(r);
+                }
+                w.base.swap(cur);   // re-baseline so we don't alarm on the same change forever
+            }
+        }
+        if (g_trip) { std::this_thread::sleep_for(seconds(2)); g_trip = false; }
+    }
+}
+
 // Raw-write / wiper monitor: independent of the file watcher, which is blind to
 // a wiper that opens the raw disk and streams zeros (no file-change events).
 //
@@ -517,6 +601,7 @@ int wmain(int argc, wchar_t** argv) {
     for (auto& d : dirs) pool.emplace_back(watchDir, d);
     pool.emplace_back(massChangeMonitor, threshold);
     pool.emplace_back(rawWriteMonitor, rawMbPerSec);
+    pool.emplace_back(criticalSectorMonitor);
     for (auto& t : pool) t.join();
     releaseDiskShield();
     g_etw.Stop();

@@ -51,7 +51,7 @@ that work:
 | **1** | **Lockdown Breaker** | Undo restriction policies, shell hijack, frozen input, lock overlays, dropped WDAC policy, **screen-takeover effects (MEMZ-style rotation/flip + effect process)** — live | ✅ **working** |
 | **1b** | **Offline WinPE rescue** | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | ✅ **working** |
 | **2** | **ASEP Cleaner** | Enumerate *all* autostart points (Run, services, tasks, IFEO, Winlogon, startup) and flag/quarantine unsigned entries — Authenticode-verified, generic, not per-virus | ✅ **working** |
-| **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's tree; **ETW deterministic attribution** + **multi-factor raw-disk wiper detection** (rate + sustain + trust; catches zero-fillers that bypass the filesystem), heuristic fallback | ✅ **working** |
+| **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's tree; **ETW deterministic attribution** + **multi-factor wiper detection** (rate + sustain + trust) + **critical-sector tripwire** (MBR/GPT/VBR tamper) + raw-disk **write shield**, heuristic fallback | ✅ **working** |
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
 | **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution **and in-kernel write veto** (inspect each write, allow/deny before it lands). Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
@@ -172,6 +172,19 @@ a *legitimate* disk tool is blocked too (stop the guard to use one). The live
 system volume still can't be `FSCTL_LOCK_VOLUME`'d outright (the registry/
 pagefile keep handles open) — but the raw-device shields cover the MBR/GPT and
 raw-sector vectors a volume lock wouldn't anyway.
+
+**Critical-sector tripwire.** A *surgical* attack — MEMZ overwriting the MBR, a
+tool zeroing the GPT header or a volume boot record — writes only a few hundred
+bytes, far below the byte-**rate** monitor's radar. But those bytes land in a
+tiny, fixed set of high-value sectors that shouldn't change outside a deliberate
+partition operation. So the guard snapshots them at startup (MBR + GPT header of
+each physical drive, and each fixed volume's boot record) and **polls them
+read-only**; if one changes, it alarms and responds. It watches the *real*
+structures rather than writing decoy bytes — writing decoys would risk
+corrupting data and wouldn't slow an attacker anyway; the value is detecting the
+change. This is detection with a short poll-window race, complementing the shield
+(prevention) and the rate monitor (bulk wipes): rate catches the batch wiper,
+the tripwire catches the boot/partition surgeon, the shield blocks both.
 
 **What still needs the kernel (Module 6):** telling *which sectors* a write
 targets (to allow a legit write to a data region but block one to the MBR-GPT
