@@ -51,7 +51,7 @@ that work:
 | **1** | **Lockdown Breaker** | Undo restriction policies, shell hijack, frozen input, lock overlays, dropped WDAC policy, **screen-takeover effects (MEMZ-style rotation/flip + effect process)** — live | ✅ **working** |
 | **1b** | **Offline WinPE rescue** | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | ✅ **working** |
 | **2** | **ASEP Cleaner** | Enumerate *all* autostart points (Run, services, tasks, IFEO, Winlogon, startup) and flag/quarantine unsigned entries — Authenticode-verified, generic, not per-virus | ✅ **working** |
-| **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's tree; **ETW deterministic attribution** + **raw-disk wiper detection** (catches zero-fillers that bypass the filesystem), heuristic fallback | ✅ **working** |
+| **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's tree; **ETW deterministic attribution** + **multi-factor raw-disk wiper detection** (rate + sustain + trust; catches zero-fillers that bypass the filesystem), heuristic fallback | ✅ **working** |
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
 | **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
@@ -134,15 +134,30 @@ tier is live.
 directory watcher sees. A **wiper** often skips the filesystem entirely, opening
 the raw disk (`\\.\PhysicalDrive0`) and streaming zeros to sectors — producing
 no file-change events at all. So a second monitor watches each process's raw
-write-**byte** rate and trips when a process sustains a very high rate
-(`--wiper-mbps`, default 150 MB/s). But a legitimate disk imager (Rufus,
-Win32DiskImager, `dd`, a USB writer) writes to a raw disk *exactly* like a wiper
-does — so the rate alone isn't enough. The discriminator is **trust**: a signed
-disk tool is exempt; only an **unsigned/untrusted** high-rate writer is frozen
-(and suspend is reversible, so a rare wrong guess is undoable). A full zero-fill
-is slow and loud; catching it mid-run turns "whole disk gone" into "a fraction
-lost". Data already overwritten is gone regardless — only the offline backup
-(Module 7) survives that.
+write-**byte** rate — but no single factor is enough, and each has an evasion:
+
+- **rate alone** — a legitimate disk imager (Rufus, Win32DiskImager, `dd`, a USB
+  writer) writes to a raw disk at the *same* rate as a wiper;
+- **signature alone** — malware can be signed (stolen/abused certs), so a
+  signature is **not a free pass**, only a raised bar;
+- **one burst** — says little; a wiper runs **sustained** (blindly continuous or
+  paced/bursty, but for a long time, because it must cover the whole disk).
+
+So it *scores*: a process over the byte-rate budget (`--wiper-mbps`, default
+150 MB/s) accrues "sustain" seconds that persist across brief dips (catching a
+*paced* wiper, not just a dumb one). An **unsigned** writer trips after a short
+sustain; a **signed** one is not exempt but must sustain far longer before it
+trips — evidence proportional to trust. The response **suspends** the culprit,
+which is itself the user-mode "stop": a frozen process issues no more writes.
+
+**Honest limits (why this isn't the whole story):** user-mode I/O counters show
+how *much* a process wrote, not to *which* disk or *which* sectors — so telling
+"zeroing system disk 0 / hitting the MBR-GPT region" from "writing my USB stick"
+needs ETW Kernel-Disk (offset + disk number), and actually **blocking** a write
+to a critical block, or **locking a volume before damage lands**, needs the
+kernel minifilter (Module 6). This tier detects-and-freezes; it does not pretend
+to pre-block. Data already overwritten is gone regardless — only the offline
+backup (Module 7) survives that.
 
 The one thing ETW still cannot do is **block** a write before it lands — only an
 in-kernel pre-write callback (Phase 6, signed driver) can. Attribution does not

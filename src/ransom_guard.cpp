@@ -283,51 +283,77 @@ static void watchDir(std::wstring dir) {
     CloseHandle(h);
 }
 
-// Raw-write / wiper monitor: independent of the file watcher. Every second it
-// measures each process's write-BYTE delta; a non-whitelisted process writing
-// faster than 'mbPerSec' MB/s sustained is almost certainly a wiper or a rogue
-// disk tool, not normal activity - so it trips the same response, which will
-// re-rank and freeze the culprit. This is what catches a raw-disk zero-filler
-// that bypasses the filesystem.
+// Raw-write / wiper monitor: independent of the file watcher, which is blind to
+// a wiper that opens the raw disk and streams zeros (no file-change events).
+//
+// A single factor is not enough, and each has a known evasion:
+//   * RATE alone       -> a legitimate disk imager (Rufus, Win32DiskImager, dd)
+//                         writes to a raw disk at the same rate as a wiper.
+//   * SIGNATURE alone  -> malware can be signed (stolen/abused certs), so a
+//                         signature is NOT a free pass, only a raised bar.
+//   * one burst        -> says little; a WIPER runs flat out and SUSTAINED,
+//                         either blindly (continuous) or paced (bursty) but for
+//                         a long time, because it must cover the whole disk.
+// So we score: a process over the byte-rate budget accrues "sustain" seconds
+// (persisting across brief dips, which captures a *paced* wiper too). An
+// UNSIGNED writer trips after a short sustain; a SIGNED one is not exempt but
+// must sustain far longer before it trips - evidence proportional to trust.
+// Suspend is reversible, so a wrong guess is undoable.
+//
+// HONEST LIMIT: user-mode IO counters show how much a process wrote, not to
+// WHICH disk or WHICH sectors. Telling "zeroing system disk 0 / hitting the
+// MBR-GPT region" from "writing my USB stick" needs ETW Kernel-Disk (offset +
+// disk number), and actually BLOCKING a write to a critical block, or locking a
+// volume before damage lands, needs the kernel minifilter (Module 6). This
+// monitor detects-and-freezes; it does not pretend to pre-block.
 static void rawWriteMonitor(int mbPerSec) {
     const ULONGLONG budget = (ULONGLONG)mbPerSec * 1024 * 1024;
+    const int kUnsignedSustain = 2;    // seconds over budget to trip if unsigned
+    const int kSignedSustain   = 12;   // signed is not exempt - just needs more
     std::map<DWORD, ULONGLONG> prev;
+    std::map<DWORD, int> sustain;      // consecutive-ish seconds over budget
     for (auto& p : snapshotProcesses())
         if (!isProtected(lower(p.name))) prev[p.pid] = procWriteBytes(p.pid);
     for (;;) {
         std::this_thread::sleep_for(seconds(1));
         auto procs = snapshotProcesses();
-        DWORD worst = 0; ULONGLONG worstRate = 0; std::wstring wname;
         std::map<DWORD, ULONGLONG> cur;
+        std::map<DWORD, std::wstring> names;
         for (auto& p : procs) {
             if (isProtected(lower(p.name))) continue;
             ULONGLONG now = procWriteBytes(p.pid);
-            cur[p.pid] = now;
+            cur[p.pid] = now; names[p.pid] = p.name;
             auto it = prev.find(p.pid);
-            if (it == prev.end()) continue;
-            ULONGLONG d = now >= it->second ? now - it->second : 0;
-            if (d > worstRate) { worstRate = d; worst = p.pid; wname = p.name; }
+            ULONGLONG d = (it != prev.end() && now >= it->second) ? now - it->second : 0;
+            if (d >= budget) sustain[p.pid] += 1;
+            else if (sustain.count(p.pid))          // decay, don't reset: a paced
+                sustain[p.pid] = (std::max)(0, sustain[p.pid] - 1);  // wiper keeps score
         }
         prev.swap(cur);
-        if (worst && worstRate >= budget) {
-            // A legitimate disk imager (Rufus, Win32DiskImager, dd, etc.) writes
-            // to a raw disk exactly like a wiper does - the ONLY cheap way to
-            // tell them apart from user mode is trust: signed disk tools are
-            // exempt; only an UNSIGNED/untrusted high-rate writer trips. Suspend
-            // is reversible anyway, so a rare wrong guess is undoable.
+
+        // pick the strongest sustained writer and decide by trust-weighted threshold
+        DWORD worst = 0; int worstSustain = 0;
+        for (auto& kv : sustain)
+            if (kv.second > worstSustain && cur.count(kv.first)) { worstSustain = kv.second; worst = kv.first; }
+
+        if (worst && worstSustain >= kUnsignedSustain) {
             std::wstring img = imagePathForPid(worst);
             sig::Trust t = img.empty() ? sig::Trust::Unsigned : sig::Verify(img);
-            if (!sig::IsTrusted(t) && !g_trip.exchange(true)) {
-                wchar_t r[224];
-                swprintf(r, 224, L"UNSIGNED %ls (pid %lu) writing %.0f MB/s to disk - possible wiper",
-                         wname.c_str(), worst, (double)worstRate / (1024.0 * 1024.0));
+            bool trusted = sig::IsTrusted(t);
+            int need = trusted ? kSignedSustain : kUnsignedSustain;
+            if (worstSustain >= need && !g_trip.exchange(true)) {
+                wchar_t r[256];
+                swprintf(r, 256,
+                    L"%ls %ls (pid %lu) sustained heavy disk writes for %ds - possible wiper",
+                    trusted ? L"SIGNED-BUT-SUSPICIOUS" : L"UNSIGNED",
+                    names.count(worst) ? names[worst].c_str() : L"?", worst, worstSustain);
                 respond(r);
-            } else if (sig::IsTrusted(t)) {
-                // Note a signed high-rate writer once per process, not every second.
+                sustain.clear();
+            } else if (trusted && worstSustain < need) {
                 static std::set<DWORD> noted;
                 if (noted.insert(worst).second)
-                    logline(L"[i] %ls (pid %lu) is writing fast but is signed (%ls) - allowed (disk tool).",
-                            wname.c_str(), worst, sig::TrustName(t));
+                    logline(L"[i] %ls (pid %lu) writing fast but signed (%ls) - watching, not yet acting.",
+                            names.count(worst) ? names[worst].c_str() : L"?", worst, sig::TrustName(t));
             }
         }
         if (g_trip) { std::this_thread::sleep_for(seconds(2)); g_trip = false; }
