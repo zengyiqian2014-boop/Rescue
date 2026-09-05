@@ -456,6 +456,161 @@ static int doList(const std::wstring& path, bool restore, const std::wstring& de
     return failed ? 1 : 0;
 }
 
+// ---------------------------------------------------- Time Machine layer ----
+// Scheduled, versioned snapshots to a user-chosen backup disk. Each run drops a
+// timestamped .rbk under <disk>\RescueBackups\, so the disk accumulates a
+// history you can restore any point from - the Windows equivalent of Time
+// Machine. A retention count prunes the oldest so the disk doesn't fill up.
+static const wchar_t* kSnapDir  = L"RescueBackups";
+static const wchar_t* kTaskName = L"Rescue Time Machine";
+
+static std::wstring snapshotFolder(const std::wstring& disk) {
+    std::wstring d = disk;
+    while (!d.empty() && (d.back() == L'\\' || d.back() == L'/')) d.pop_back();
+    return d + L"\\" + kSnapDir;
+}
+
+// Delete the oldest snapshots beyond 'keep'. Names sort chronologically
+// (rescue-YYYYMMDD-HHMMSS.rbk), so lexical order is time order.
+static void pruneSnapshots(const std::wstring& folder, int keep) {
+    if (keep <= 0) return;
+    std::vector<std::wstring> snaps;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((folder + L"\\rescue-*.rbk").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) snaps.push_back(fd.cFileName); }
+        while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(snaps.begin(), snaps.end());
+    int remove = (int)snaps.size() - keep;
+    for (int i = 0; i < remove; ++i) {
+        std::wstring victim = folder + L"\\" + snaps[i];
+        if (DeleteFileW(victim.c_str()))
+            wprintf(L"  pruned old snapshot: %ls\n", snaps[i].c_str());
+    }
+}
+
+static int doSnapshot(const std::wstring& disk, int keep) {
+    DWORD attr = GetFileAttributesW(disk.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        wprintf(L"[!] backup disk not found: %ls  (is it plugged in?)\n", disk.c_str());
+        return 1;
+    }
+    std::wstring folder = snapshotFolder(disk);
+    CreateDirectoryW(folder.c_str(), nullptr);
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t stamp[32];
+    swprintf(stamp, 32, L"rescue-%04d%02d%02d-%02d%02d%02d.rbk",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::wstring out = folder + L"\\" + stamp;
+    wprintf(L"snapshot -> %ls\n", out.c_str());
+    int rc = doBackup(out);
+    if (rc == 0) pruneSnapshots(folder, keep);
+    return rc;
+}
+
+static int listSnapshots(const std::wstring& disk) {
+    std::wstring folder = snapshotFolder(disk);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((folder + L"\\rescue-*.rbk").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) { wprintf(L"no snapshots on %ls\n", disk.c_str()); return 0; }
+    std::vector<std::pair<std::wstring, uint64_t>> snaps;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        snaps.emplace_back(fd.cFileName, sz);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(snaps.begin(), snaps.end());
+    wprintf(L"== snapshots on %ls ==\n", folder.c_str());
+    for (auto& sp : snaps) wprintf(L"  %ls   %ls\n", sp.first.c_str(), humanSize(sp.second).c_str());
+    wprintf(L"%zu snapshot(s). Restore one with:\n  backup --restore \"%ls\\<name>\" --to DIR\n",
+            snaps.size(), folder.c_str());
+    return 0;
+}
+
+// Run schtasks and report success.
+static bool schtasks(const std::wstring& args) {
+    std::wstring cmd = L"schtasks " + args;
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &si, &pi)) return false;
+    WaitForSingleObject(pi.hProcess, 30000);
+    DWORD rc = 1; GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return rc == 0;
+}
+
+// Translate a preset or a custom every/unit into schtasks /SC and /MO flags.
+// Presets encode the guidance the user asked for by data importance.
+static bool resolveSchedule(const std::wstring& preset, int every, const std::wstring& unit,
+                            std::wstring& scFlags, std::wstring& human) {
+    auto set = [&](const wchar_t* sc, int mo, const wchar_t* hm) {
+        scFlags = std::wstring(L"/SC ") + sc;
+        if (mo > 1) scFlags += L" /MO " + std::to_wstring(mo);
+        human = hm;
+    };
+    if (!preset.empty()) {
+        if (preset == L"monthly")   { set(L"MONTHLY", 1, L"once a month (low-importance data)"); return true; }
+        if (preset == L"weekly")    { set(L"WEEKLY",  1, L"once a week"); return true; }
+        if (preset == L"every5days"){ set(L"DAILY",   5, L"every 5 days (important data)"); return true; }
+        if (preset == L"daily")     { set(L"DAILY",   1, L"every day (important data)"); return true; }
+        if (preset == L"hourly")    { set(L"HOURLY",  1, L"every hour (critical data)"); return true; }
+        wprintf(L"[!] unknown preset: %ls (use monthly|weekly|every5days|daily|hourly)\n", preset.c_str());
+        return false;
+    }
+    if (every > 0 && !unit.empty()) {
+        std::wstring u = unit;
+        for (auto& c : u) c = towlower(c);
+        if (u == L"second" || u == L"seconds") {
+            wprintf(L"[!] per-second backups are not possible: a backup takes far longer than\n"
+                    L"    a second, and the scheduler's minimum interval is one minute. Use\n"
+                    L"    --unit minute (or an importance preset) instead.\n");
+            return false;
+        }
+        if (u == L"minute" || u == L"minutes") { set(L"MINUTE", every, L"custom"); }
+        else if (u == L"hour" || u == L"hours"){ set(L"HOURLY", every, L"custom"); }
+        else if (u == L"day"  || u == L"days") { set(L"DAILY",  every, L"custom"); }
+        else if (u == L"week" || u == L"weeks"){ set(L"WEEKLY", every, L"custom"); }
+        else if (u == L"month"|| u == L"months"){ set(L"MONTHLY", every, L"custom"); }
+        else { wprintf(L"[!] unknown unit: %ls (minute|hour|day|week|month)\n", unit.c_str()); return false; }
+        human = L"every " + std::to_wstring(every) + L" " + unit;
+        return true;
+    }
+    wprintf(L"[!] --schedule needs a preset, or --every N --unit <minute|hour|day|week|month>\n");
+    return false;
+}
+
+static int scheduleBackup(const std::wstring& disk, const std::wstring& preset,
+                          int every, const std::wstring& unit, int keep) {
+    if (disk.empty()) { wprintf(L"[!] scheduling needs --disk <backup drive> (e.g. E:)\n"); return 2; }
+    std::wstring scFlags, human;
+    if (!resolveSchedule(preset, every, unit, scFlags, human)) return 2;
+
+    wchar_t self[MAX_PATH * 2];
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH * 2)) return 1;
+
+    // The task runs this same exe as SYSTEM, taking a snapshot to the chosen disk
+    // and pruning to 'keep'. Quotes are doubled for schtasks' nested /TR string.
+    std::wstring tr = L"\\\"" + std::wstring(self) + L"\\\" --snapshot \\\"" + disk +
+                      L"\\\" --keep " + std::to_wstring(keep);
+    std::wstring args = L"/Create /F /RU SYSTEM /RL HIGHEST /TN \"" + std::wstring(kTaskName) +
+                        L"\" " + scFlags + L" /TR \"" + tr + L"\"";
+    if (!schtasks(args)) {
+        wprintf(L"[!] scheduling failed (run elevated?).\n");
+        return 1;
+    }
+    wprintf(L"scheduled: Rescue Time Machine, %ls\n", human.c_str());
+    wprintf(L"  backup disk : %ls\n", disk.c_str());
+    wprintf(L"  keep        : %d most recent snapshots\n", keep);
+    wprintf(L"  each run writes a timestamped .rbk to %ls\\%ls\\\n", disk.c_str(), kSnapDir);
+    wprintf(L"Manage it in Task Scheduler, or: backup --unschedule / --schedule-status\n");
+    return 0;
+}
+
 // ------------------------------------------------------------------- main ----
 static void usage() {
     wprintf(
@@ -464,14 +619,26 @@ static void usage() {
         L"                               HKCU registry, and a program list\n"
         L"  backup --list FILE.rbk       show what a container holds\n"
         L"  backup --restore FILE.rbk --to DIR    extract everything under DIR\n\n"
+        L"TIME MACHINE (scheduled, versioned snapshots to a backup disk):\n"
+        L"  backup --snapshot E: [--keep N]   one timestamped snapshot to E:\\RescueBackups\n"
+        L"  backup --list-snapshots E:        list the history on a backup disk\n"
+        L"  backup --schedule PRESET --disk E: [--keep N]   automate it\n"
+        L"       PRESET = monthly    (low-importance data)\n"
+        L"                every5days | daily   (important data)\n"
+        L"                hourly     (critical data)\n"
+        L"  backup --schedule custom --every N --unit minute|hour|day|week|month --disk E:\n"
+        L"  backup --schedule-status | --unschedule\n\n"
         L"The OS itself is deliberately excluded: reinstall Windows from clean media\n"
         L"(the official Media Creation Tool), then restore this user layer on top.\n"
-        L"Store the .rbk on external/offline media - a backup malware can reach is\n"
-        L"not a backup.\n");
+        L"Keep the backup disk external/offline between backups - a backup malware\n"
+        L"can reach is not a backup.\n");
 }
 
 int wmain(int argc, wchar_t** argv) {
     std::wstring outFile, listFile, restoreFile, dest;
+    std::wstring snapDisk, schedPreset, schedDisk, listSnapDisk, unit;
+    int keep = 10, every = 0;
+    bool wantSchedStatus = false, wantUnschedule = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--help" || a == L"-h") { usage(); return 0; }
@@ -479,19 +646,47 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--list" && i + 1 < argc) listFile = argv[++i];
         else if (a == L"--restore" && i + 1 < argc) restoreFile = argv[++i];
         else if (a == L"--to" && i + 1 < argc) dest = argv[++i];
+        else if (a == L"--snapshot" && i + 1 < argc) snapDisk = argv[++i];
+        else if (a == L"--list-snapshots" && i + 1 < argc) listSnapDisk = argv[++i];
+        else if (a == L"--schedule" && i + 1 < argc) schedPreset = argv[++i];
+        else if (a == L"--disk" && i + 1 < argc) schedDisk = argv[++i];
+        else if (a == L"--every" && i + 1 < argc) every = _wtoi(argv[++i]);
+        else if (a == L"--unit" && i + 1 < argc) unit = argv[++i];
+        else if (a == L"--keep" && i + 1 < argc) keep = _wtoi(argv[++i]);
+        else if (a == L"--schedule-status") wantSchedStatus = true;
+        else if (a == L"--unschedule") wantUnschedule = true;
         else { wprintf(L"unknown option: %ls\n\n", a.c_str()); usage(); return 2; }
     }
-    if (outFile.empty() && listFile.empty() && restoreFile.empty()) { usage(); return 0; }
+
+    // schedule management doesn't need privileges/compression
+    if (wantUnschedule) {
+        bool ok = schtasks(L"/Delete /F /TN \"" + std::wstring(kTaskName) + L"\"");
+        wprintf(ok ? L"scheduled backup removed.\n" : L"[!] no scheduled backup, or removal failed.\n");
+        return ok ? 0 : 1;
+    }
+    if (wantSchedStatus) {
+        schtasks(L"/Query /TN \"" + std::wstring(kTaskName) + L"\" /V /FO LIST");
+        return 0;
+    }
+    if (!schedPreset.empty())
+        return scheduleBackup(schedDisk, schedPreset == L"custom" ? L"" : schedPreset,
+                              every, unit, keep);
+    if (!listSnapDisk.empty()) return listSnapshots(listSnapDisk);
+
+    if (outFile.empty() && listFile.empty() && restoreFile.empty() && snapDisk.empty()) {
+        usage(); return 0;
+    }
 
     initCompression();
-    if (!g_canCompress && !outFile.empty())
+    if (!g_canCompress && (!outFile.empty() || !snapDisk.empty()))
         wprintf(L"[i] compression unavailable on this runtime; storing members raw.\n");
     // SYSTEM/Debug so we can read other-profile and ACL-locked user files.
     priv::EnableDebugPrivilege();
     priv::ImpersonateSystem();
 
     int rc = 0;
-    if (!outFile.empty())          rc = doBackup(outFile);
+    if (!snapDisk.empty())         rc = doSnapshot(snapDisk, keep);
+    else if (!outFile.empty())     rc = doBackup(outFile);
     else if (!listFile.empty())    rc = doList(listFile, false, L"");
     else if (!restoreFile.empty()) rc = doList(restoreFile, true, dest);
 

@@ -55,7 +55,7 @@ that work:
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
 | **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
-| **7** | **Backup & Restore** | Ransomware-resilient backup of user data + settings + HKCU into a compressed `.rbk` container; system files excluded, restore rebuilds the user layer | ✅ **working** |
+| **7** | **Backup & Restore** | Ransomware-resilient `.rbk` backup of user data + settings + HKCU; **scheduled versioned snapshots to a chosen disk (Time Machine-style)**, retention, and recovery-disk builder | ✅ **working** |
 
 ## Module 1 — Lockdown Breaker
 
@@ -304,6 +304,58 @@ straight about the limits is the point of this project:
 Run it elevated (it borrows SYSTEM to read ACL-locked profile files), and
 **keep the `.rbk` on external or offline media** — a backup the ransomware can
 encrypt along with everything else is not a backup.
+
+### Scheduled snapshots (Time Machine for Windows)
+
+A backup you have to remember to run is a backup you won't have. Module 7 can
+run itself on a schedule, keeping a **versioned history** on a disk you choose —
+the Windows equivalent of Apple's Time Machine.
+
+```
+backup --snapshot E:                 one timestamped snapshot to E:\RescueBackups
+backup --list-snapshots E:           the history on that disk
+backup --schedule daily --disk E: --keep 14      automate it (keep last 14)
+backup --schedule custom --every 6 --unit hour --disk E:
+backup --schedule-status | --unschedule
+```
+
+Pick the cadence by how much you'd hate to lose:
+
+| Data importance | Suggested schedule |
+| --- | --- |
+| Low — you could recreate it | `--schedule monthly` |
+| Important | `--schedule every5days` or `--schedule daily` |
+| Critical — can't lose a day | `--schedule hourly` |
+
+`--keep N` prunes the oldest so the disk doesn't fill. **Per-second backups are
+refused on purpose**: a backup takes far longer than a second and the scheduler's
+floor is one minute — the tool says so rather than pretending. Point `--disk` at
+an **external** drive and, ideally, unplug it between runs: a schedule that keeps
+the backup disk permanently mounted is convenient but reachable by the very
+ransomware you're guarding against.
+
+### Making the backup disk a recovery disk
+
+`offline/Make-RescueDisk.ps1` turns a USB into a recovery stick, at three honest
+levels:
+
+- **`-Mode data`** — copies the Rescue tools, the offline cleanup scripts, and
+  your newest `.rbk` onto the stick. Needs nothing from Microsoft. Boot any
+  Windows/WinPE media, then clean and restore from the stick.
+- **`-Mode bootable`** — a stick that boots on its own into WinPE with the tools
+  ready. WinPE is Microsoft's and **can't be redistributed**, so the script uses
+  your free **Windows ADK + WinPE add-on** (it prints the one `winget` command if
+  they're missing) to build the boot media, then lays the Rescue payload on top.
+- **`-Mode system-image`** — a full, block-level image of the whole OS via
+  Windows' built-in **`wbadmin`** (free, no signing), so recovery restores the
+  machine to its previous state, **bootable and ready to use**. Recover it from
+  Windows install media → *System Image Recovery*.
+
+Which to use: the `.rbk` snapshots restore *your files and settings* onto a
+clean or existing Windows (apps must be reinstalled — that's why the backup
+includes a program list); the `wbadmin` system image restores *the entire OS
+exactly*. The first is smaller and malware-version-proof; the second is
+"one-click back to how it was". Keep both if the data is critical.
 
 ## Phase 1b — Offline WinPE rescue
 
