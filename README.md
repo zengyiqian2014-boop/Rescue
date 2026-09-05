@@ -48,10 +48,10 @@ that work:
 
 | Phase | Module | What it does | State |
 | --- | --- | --- | --- |
-| **1** | **Lockdown Breaker** | Undo restriction policies, shell hijack, frozen input, lock overlays, dropped WDAC policy — on the live system | ✅ **working** |
+| **1** | **Lockdown Breaker** | Undo restriction policies, shell hijack, frozen input, lock overlays, dropped WDAC policy, **screen-takeover effects (MEMZ-style rotation/flip + effect process)** — live | ✅ **working** |
 | **1b** | **Offline WinPE rescue** | Same cleanup from a boot USB, where the malware isn't running (beats signed/enforced policies) | ✅ **working** |
 | **2** | **ASEP Cleaner** | Enumerate *all* autostart points (Run, services, tasks, IFEO, Winlogon, startup) and flag/quarantine unsigned entries — Authenticode-verified, generic, not per-virus | ✅ **working** |
-| **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's process tree; **ETW gives deterministic per-process attribution** (no driver), heuristic fallback | ✅ **working** |
+| **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's tree; **ETW deterministic attribution** + **raw-disk wiper detection** (catches zero-fillers that bypass the filesystem), heuristic fallback | ✅ **working** |
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
 | **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
@@ -81,6 +81,10 @@ What it walks:
 - **Frozen input** — issues `BlockInput(FALSE)` to release a `BlockInput` lock.
 - **Full-screen lock overlays** — lists suspicious top-most, full-screen windows
   (never the real shell) and, with `--kill-overlays`, closes them.
+- **Screen-takeover effects (MEMZ / rainbow-cat and imitators)** — resets a
+  flipped/rotated display back to default, and with `--kill-effects` terminates
+  the process tree behind a full-screen effect overlay (the ones that ignore a
+  polite `WM_CLOSE`), so the mouse-jitter/tunnel/rotation stops and you can work.
 - **Dropped WDAC / Code-Integrity policy** — finds `SiPolicy.p7b` and
   `CiPolicies\Active\*.cip`, backs them up, and with `--remove-ci-policy`
   attempts removal. **If the policy is being enforced (Microsoft-signed /
@@ -125,6 +129,16 @@ Memory Integrity left fully on** and no kernel driver. It needs elevation (a
 real-time ETW session does); if the session can't start it falls back to ranking
 processes by write-I/O rate (the previous heuristic), and the banner says which
 tier is live.
+
+**Wiper defense (raw-disk writes).** A ransomware encrypts *files*, which the
+directory watcher sees. A **wiper** often skips the filesystem entirely, opening
+the raw disk (`\\.\PhysicalDrive0`) and streaming zeros to sectors — producing
+no file-change events at all. So a second monitor watches each process's raw
+write-**byte** rate and trips when one non-whitelisted process sustains a very
+high rate (`--wiper-mbps`, default 150 MB/s), freezing it. A full zero-fill is
+slow and loud; catching it mid-run turns "whole disk gone" into "a fraction
+lost". Data that was already overwritten is gone regardless — only the offline
+backup (Module 7) survives that.
 
 The one thing ETW still cannot do is **block** a write before it lands — only an
 in-kernel pre-write callback (Phase 6, signed driver) can. Attribution does not

@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <utility>
 #include "privilege.h"
 
 // ---------------------------------------------------------------------------
@@ -195,7 +196,8 @@ static void unfreezeInput() {
 // ---------------------------------------------------------------------------
 // full-screen "locked" overlay windows
 // ---------------------------------------------------------------------------
-struct OverlayCtx { bool kill; };
+static void killTree(DWORD root);   // defined below; used to stop an effect process
+struct OverlayCtx { bool kill; bool killProc; };
 static BOOL CALLBACK enumOverlays(HWND hwnd, LPARAM lp) {
     auto* ctx = reinterpret_cast<OverlayCtx*>(lp);
     if (!IsWindowVisible(hwnd)) return TRUE;
@@ -222,14 +224,82 @@ static BOOL CALLBACK enumOverlays(HWND hwnd, LPARAM lp) {
         done(L"WM_CLOSE sent to overlay window");
         ++g_fixed;
     }
+    if (ctx->killProc && pid) {
+        // An effect process that ignores WM_CLOSE (MEMZ-style) must be killed.
+        // The shell classes were already excluded above, so this is safe.
+        killTree(pid);
+        done(L"terminated the overlay/effect process tree");
+        ++g_fixed;
+    }
     return TRUE;
 }
 
-static void scanOverlays(bool kill) {
-    head(L"Full-screen lock overlays");
-    if (!kill) info(L"(run with --kill-overlays to close suspicious overlay windows)");
-    OverlayCtx ctx{kill && g_fix};
+static void scanOverlays(bool kill, bool killEffects) {
+    head(L"Full-screen lock overlays / screen-takeover effects");
+    if (!kill && !killEffects)
+        info(L"(--kill-overlays closes overlay windows; --kill-effects also kills the process)");
+    OverlayCtx ctx{kill && g_fix, killEffects && g_fix};
     EnumWindows(enumOverlays, reinterpret_cast<LPARAM>(&ctx));
+}
+
+// ---------------------------------------------------------------------------
+// screen takeover: rotation/flip and moving-effect processes (MEMZ-style)
+// ---------------------------------------------------------------------------
+// Some destructive "prank" malware (MEMZ / rainbow-cat and imitators) doesn't
+// lock you out with a policy - it takes the SCREEN: rotates/flips the display,
+// draws tunnel/replicating effects, and jitters the mouse so you can't act. The
+// display rotation is a documented setting we can just put back; the effects are
+// a running process we can identify (it owns a topmost full-screen window and is
+// unsigned) and terminate so the screen goes still enough to work.
+
+// Reset every monitor to its default (landscape) orientation if malware flipped
+// or rotated it. Best-effort and harmless when nothing was changed.
+static void resetDisplayOrientation() {
+    head(L"Display rotation / flip");
+    bool any = false;
+    DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+        DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) continue;
+        if ((dm.dmFields & DM_DISPLAYORIENTATION) && dm.dmDisplayOrientation != DMDO_DEFAULT) {
+            found(L"display rotated: %ls", dd.DeviceName);
+            if (g_fix) {
+                // Rotating back to 0 may require swapping width/height back.
+                if (dm.dmDisplayOrientation == DMDO_90 || dm.dmDisplayOrientation == DMDO_270) {
+                    DWORD t = dm.dmPelsWidth; dm.dmPelsWidth = dm.dmPelsHeight; dm.dmPelsHeight = t;
+                }
+                dm.dmDisplayOrientation = DMDO_DEFAULT;
+                dm.dmFields = DM_DISPLAYORIENTATION | DM_PELSWIDTH | DM_PELSHEIGHT;
+                LONG r = ChangeDisplaySettingsExW(dd.DeviceName, &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+                done(r == DISP_CHANGE_SUCCESSFUL ? L"orientation reset to default"
+                                                 : L"orientation reset attempted (may need reboot)");
+                ++g_fixed;
+            }
+            any = true;
+        }
+    }
+    if (!any) info(L"no rotated/flipped display detected");
+}
+
+// Terminate a process tree (used to stop an effect process that ignores WM_CLOSE).
+static void killTree(DWORD root) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    std::vector<std::pair<DWORD,DWORD>> edges;   // (pid, ppid)
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe))
+            do { edges.push_back({pe.th32ProcessID, pe.th32ParentProcessID}); }
+            while (Process32NextW(snap, &pe));
+        CloseHandle(snap);
+    }
+    std::vector<DWORD> tree{root};
+    for (size_t i = 0; i < tree.size(); ++i)
+        for (auto& e : edges) if (e.second == tree[i]) tree.push_back(e.first);
+    for (DWORD pid : tree) {
+        HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if (h) { TerminateProcess(h, 1); CloseHandle(h); }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +363,9 @@ static void usage() {
         L"  --fix                apply fixes: clear restriction policies, restore the\n"
         L"                       login shell, release BlockInput\n"
         L"  --kill-overlays      with --fix, close full-screen lock overlay windows\n"
+        L"  --kill-effects       with --fix, KILL screen-takeover effect processes\n"
+        L"                       (MEMZ/rainbow-cat: rotation, tunnel, mouse jitter)\n"
+        L"                       and reset any flipped/rotated display\n"
         L"  --remove-ci-policy   with --fix, back up & attempt to remove a dropped\n"
         L"                       WDAC/Code-Integrity policy (offline is more reliable)\n"
         L"  -h, --help           this help\n\n"
@@ -300,10 +373,11 @@ static void usage() {
 }
 
 int wmain(int argc, wchar_t** argv) {
-    bool killOverlays = false, removeCi = false;
+    bool killOverlays = false, removeCi = false, killEffects = false;
     for (int i = 1; i < argc; ++i) {
         if      (!_wcsicmp(argv[i], L"--fix"))              g_fix = true;
         else if (!_wcsicmp(argv[i], L"--kill-overlays"))    killOverlays = true;
+        else if (!_wcsicmp(argv[i], L"--kill-effects"))     killEffects = true;
         else if (!_wcsicmp(argv[i], L"--remove-ci-policy")) removeCi = true;
         else if (!_wcsicmp(argv[i], L"-h") || !_wcsicmp(argv[i], L"--help")) { usage(); return 0; }
         else { wprintf(L"unknown option: %ls\n\n", argv[i]); usage(); return 2; }
@@ -326,7 +400,8 @@ int wmain(int argc, wchar_t** argv) {
                   sizeof(kMachinePolicies) / sizeof(kMachinePolicies[0]));
     scanShellHijack();
     unfreezeInput();
-    scanOverlays(killOverlays);
+    resetDisplayOrientation();
+    scanOverlays(killOverlays, killEffects);
     scanCodeIntegrity(removeCi);
 
     priv::Revert();

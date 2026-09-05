@@ -121,6 +121,23 @@ static ULONGLONG procWriteOps(DWORD pid) {
     return v;
 }
 
+// Bytes written by a process. A ransomware encrypts files (file-system writes,
+// caught by the directory watcher); a WIPER often opens the raw disk
+// (\\.\PhysicalDrive0 / \\.\C:) and streams zeros straight to sectors -
+// which produces NO ReadDirectoryChangesW events at all, so the file watcher is
+// blind to it. But those raw writes still count as the process's write BYTES,
+// so a sustained, very high write-byte rate from one process is the signature
+// of a wiper the file watcher would miss.
+static ULONGLONG procWriteBytes(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    IO_COUNTERS io{};
+    ULONGLONG v = 0;
+    if (GetProcessIoCounters(h, &io)) v = io.WriteTransferCount;
+    CloseHandle(h);
+    return v;
+}
+
 // Suspend / resume / kill every thread of a process and its descendants.
 static void forEachDescendant(DWORD root, std::vector<DWORD>& out) {
     auto procs = snapshotProcesses();
@@ -254,6 +271,42 @@ static void watchDir(std::wstring dir) {
     CloseHandle(h);
 }
 
+// Raw-write / wiper monitor: independent of the file watcher. Every second it
+// measures each process's write-BYTE delta; a non-whitelisted process writing
+// faster than 'mbPerSec' MB/s sustained is almost certainly a wiper or a rogue
+// disk tool, not normal activity - so it trips the same response, which will
+// re-rank and freeze the culprit. This is what catches a raw-disk zero-filler
+// that bypasses the filesystem.
+static void rawWriteMonitor(int mbPerSec) {
+    const ULONGLONG budget = (ULONGLONG)mbPerSec * 1024 * 1024;
+    std::map<DWORD, ULONGLONG> prev;
+    for (auto& p : snapshotProcesses())
+        if (!isProtected(lower(p.name))) prev[p.pid] = procWriteBytes(p.pid);
+    for (;;) {
+        std::this_thread::sleep_for(seconds(1));
+        auto procs = snapshotProcesses();
+        DWORD worst = 0; ULONGLONG worstRate = 0; std::wstring wname;
+        std::map<DWORD, ULONGLONG> cur;
+        for (auto& p : procs) {
+            if (isProtected(lower(p.name))) continue;
+            ULONGLONG now = procWriteBytes(p.pid);
+            cur[p.pid] = now;
+            auto it = prev.find(p.pid);
+            if (it == prev.end()) continue;
+            ULONGLONG d = now >= it->second ? now - it->second : 0;
+            if (d > worstRate) { worstRate = d; worst = p.pid; wname = p.name; }
+        }
+        prev.swap(cur);
+        if (worst && worstRate >= budget && !g_trip.exchange(true)) {
+            wchar_t r[192];
+            swprintf(r, 192, L"%ls (pid %lu) is writing %.0f MB/s - possible disk wiper",
+                     wname.c_str(), worst, (double)worstRate / (1024.0 * 1024.0));
+            respond(r);
+        }
+        if (g_trip) { std::this_thread::sleep_for(seconds(2)); g_trip = false; }
+    }
+}
+
 // mass-modification detector: too many file events in a short window == attack.
 static void massChangeMonitor(int threshold) {
     for (;;) {
@@ -286,6 +339,9 @@ static void usage() {
         L"  --watch <dir>     watch this folder (repeatable). Default: your\n"
         L"                    Desktop, Documents, Pictures.\n"
         L"  --threshold <n>   files-changed-per-second that counts as an attack (default 40)\n"
+        L"  --wiper-mbps <n>  raw write-rate (MB/s) from one process that counts as a\n"
+        L"                    disk wiper - catches raw-disk zero-fillers the file\n"
+        L"                    watcher can't see (default 150)\n"
         L"  --kill            KILL the culprit instead of suspending it (irreversible)\n"
         L"  -h, --help        this help\n\n"
         L"Leave it running. On a trip it suspends the busiest writer's process tree\n"
@@ -295,10 +351,12 @@ static void usage() {
 int wmain(int argc, wchar_t** argv) {
     std::vector<std::wstring> dirs;
     int threshold = 40;
+    int rawMbPerSec = 150;   // raw-write rate that counts as a wiper
     for (int i = 1; i < argc; ++i) {
         if (!_wcsicmp(argv[i], L"--watch") && i + 1 < argc) dirs.push_back(argv[++i]);
         else if (!_wcsicmp(argv[i], L"--threshold") && i + 1 < argc) threshold = _wtoi(argv[++i]);
         else if (!_wcsicmp(argv[i], L"--kill")) g_kill = true;
+        else if (!_wcsicmp(argv[i], L"--wiper-mbps") && i + 1 < argc) rawMbPerSec = _wtoi(argv[++i]);
         else if (!_wcsicmp(argv[i], L"-h") || !_wcsicmp(argv[i], L"--help")) { usage(); return 0; }
         else { wprintf(L"unknown option: %ls\n\n", argv[i]); usage(); return 2; }
     }
@@ -332,6 +390,7 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<std::thread> pool;
     for (auto& d : dirs) pool.emplace_back(watchDir, d);
     pool.emplace_back(massChangeMonitor, threshold);
+    pool.emplace_back(rawWriteMonitor, rawMbPerSec);
     for (auto& t : pool) t.join();
     g_etw.Stop();
     return 0;

@@ -96,3 +96,30 @@ Boot back on.
   and leave `ransom_guard` running.
 - Keep the `RescueBackup` folder until you're sure everything works — it holds
   the removed policy files (also useful as forensic evidence).
+
+
+## Disk & boot recovery (Rescue-Recover.ps1)
+
+For damage that "reset this PC" can't touch and that does **not** mean the data
+is gone. Run from a WinPE/WinRE USB against the offline system:
+
+- **Boot record trashed** (MEMZ / rainbow-cat overwriting the MBR so the machine
+  won't boot): `Rescue-Recover.ps1 -RepairBoot -OsDrive C:` rewrites the boot
+  code with the built-in `bootrec`/`bootsect`. Data and Windows are untouched —
+  only the boot sector is repaired.
+- **Partition table destroyed / partition shows grey & "unavailable"**: the file
+  data is still in the sectors, only the index was wiped.
+  `Rescue-Recover.ps1 -RecoverPartition -SourceDisk 0` drives **TestDisk** to
+  rebuild the partition table so the volume and files reappear.
+- **Quick-format / deleted files**: `-CarveFiles -SourceDisk 0 -OutDir E:\Recovered`
+  drives **PhotoRec** to carve files back by signature.
+
+Honest limits:
+- Data that was truly **overwritten** (a zero-fill wiper, or correct encryption)
+  is **not** recoverable by any tool — only the offline backup (Module 7)
+  survives that.
+- **TestDisk/PhotoRec are third-party GPL tools** (CGSecurity), **not bundled**.
+  Put `testdisk.exe` / `photorec.exe` on the rescue USB or pass `-ToolDir`; the
+  script wires the workflow and refuses to guess if they're absent.
+- **Never recover onto the source disk** — `-OutDir` must be a different disk, or
+  a write can overwrite the very data you're saving.
