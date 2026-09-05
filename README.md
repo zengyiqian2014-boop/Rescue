@@ -54,7 +54,7 @@ that work:
 | **3** | **Anti-ransomware guard** | Canary files + watcher + mass-change detection → freeze the culprit's tree; **ETW deterministic attribution** + **multi-factor raw-disk wiper detection** (rate + sustain + trust; catches zero-fillers that bypass the filesystem), heuristic fallback | ✅ **working** |
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
-| **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
+| **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution **and in-kernel write veto** (inspect each write, allow/deny before it lands). Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
 | **7** | **Backup & Restore** | Ransomware-resilient `.rbk` backup of user data + settings + HKCU; **scheduled versioned snapshots to a chosen disk (Time Machine-style)**, retention, and recovery-disk builder | ✅ **working** |
 
 ## Module 1 — Lockdown Breaker

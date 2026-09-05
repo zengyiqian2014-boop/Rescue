@@ -39,10 +39,21 @@ is intentionally excluded from the top-level `make`.
 - The service correlates rate/pattern across PIDs and stops the real culprit
   **with certainty** — no more "top writer" guessing.
 
-This first version *observes and reports*. Blocking a write in-kernel
-(`FLT_PREOP_COMPLETE` with `STATUS_ACCESS_DENIED` once a PID is confirmed
-malicious) is a deliberate next step, gated behind the service's decision so a
-false positive can't brick the machine.
+**Enforcement is now implemented in source, not just observation.** The driver
+reports every attributed WRITE/RENAME/DELETE *and* enforces a PID blocklist: the
+user-mode service watches the event stream, decides who is malicious (its
+signatures + heuristics), and sends `RM_CMD_BLOCK_PID` back over the same port;
+from then on the driver refuses that PID's writes in the pre-operation callback
+with `FLT_PREOP_COMPLETE` + `STATUS_ACCESS_DENIED` — vetting each write in the
+I/O path and denying it **before it lands**. This is the "inspect every write,
+then allow or deny" tier, and it can *only* live in the kernel: user mode is not
+in the write path, so no amount of user-mode aggressiveness can do it (API
+hooking is per-process and bypassable via direct syscalls / raw handles — not a
+security boundary). Policy stays in user mode (so a false positive is a cleared
+`RM_CMD_UNBLOCK_PID`, not a bricked machine); enforcement lives where writes
+actually pass. The blocklist is guarded by a `KSPIN_LOCK` because a write pre-op
+can run at `DISPATCH_LEVEL`. Still needs signing to load — that gate is the whole
+reason this tier isn't already shipping.
 
 ## Building (Windows, WDK)
 
