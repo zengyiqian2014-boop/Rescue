@@ -55,6 +55,7 @@ that work:
 | **4** | **Scanner** | Heuristic + hash on-demand scanner: Authenticode triage, Mark-of-the-Web, PE structure analysis, script markers, quarantine, scheduled scans, optional ClamAV hand-off | ✅ **working** |
 | **5** | **Watchdog** | Windows service that keeps the guard alive + a paired companion; kill either and the other restarts it | ✅ **working** |
 | **6** | **Kernel minifilter** | The "can't be killed" tier — per-write attribution in kernel. Source complete + install/revert scripts; needs WDK build + Microsoft attestation signing | 🧩 **source** |
+| **7** | **Backup & Restore** | Ransomware-resilient backup of user data + settings + HKCU into a compressed `.rbk` container; system files excluded, restore rebuilds the user layer | ✅ **working** |
 
 ## Module 1 — Lockdown Breaker
 
@@ -254,6 +255,56 @@ changes nothing about the machine, and the lab one takes itemised typed consent
 and reverts exactly what it changed. This is the one tier that can't be a
 cross-compiled `.exe`, and the docs are explicit about why.
 
+## Module 7 — Backup & Restore
+
+Every other module tries to *stop* damage. This one *undoes* it. A correctly
+encrypted file cannot be decrypted (that is mathematics, stated up top) — so the
+only real recovery is a copy made **before** the attack, kept somewhere the
+malware could not reach. Module 7 makes that copy, and restores it.
+
+```
+backup --out FILE.rbk               back up user data, settings, HKCU, program list
+backup --list FILE.rbk              show what a container holds
+backup --restore FILE.rbk --to DIR extract everything under DIR
+```
+
+**What it backs up — and pointedly what it does not.** The OS is *excluded on
+purpose*: you reinstall Windows from clean media, not from a backup that might
+carry the infection forward. What matters, and what it captures, is the layer a
+user can actually change and cannot get back:
+
+- profile document folders (Desktop, Documents, Pictures, Videos, Music,
+  Downloads, Favorites, …, and OneDrive if present);
+- application settings in Roaming and Local AppData, **minus caches/temp**
+  (Temp, INetCache, thumbcache, browser Cache/GPUCache/Code Cache, UWP package
+  caches) — those are churn, not settings, and would bloat the backup;
+- the **HKCU** registry hive (personalization, environment variables, file
+  associations);
+- a reference list of installed programs, so you know what to reinstall.
+
+**The container.** One self-describing `.rbk` file. Each member is stored
+compressed (Windows' built-in XPRESS_HUFF) *only when that is actually smaller* —
+already-compressed files (jpg, mp4, zip) are kept raw rather than wastefully
+re-packed. Restore needs no external index and reconstructs paths, timestamps,
+and attributes. Restore refuses `..` path components, so a crafted container
+can't write outside the target directory. The registry export is restored **as a
+file** for you to review and import, never merged silently.
+
+**Two things this module deliberately does not pretend to do**, because being
+straight about the limits is the point of this project:
+
+- **It does not bundle a Windows ISO** into rescue media. Redistributing Windows
+  violates Microsoft's licence — use the official Media Creation Tool for clean
+  media, and let this restore the user layer on top of it.
+- **It is not a "leaves no trace" reboot.** A reboot that truly discards every
+  disk change needs write-redirection in a filesystem filter driver — the same
+  signed-kernel tier as Phase 6 (think Deep Freeze). A user-mode tool cannot do
+  that honestly, so it doesn't claim to.
+
+Run it elevated (it borrows SYSTEM to read ACL-locked profile files), and
+**keep the `.rbk` on external or offline media** — a backup the ransomware can
+encrypt along with everything else is not a backup.
+
 ## Phase 1b — Offline WinPE rescue
 
 When the machine is locked so hard that even the live tools can't run — a
@@ -268,7 +319,7 @@ signature can't stop you deleting it.
 
 ```bash
 make          # both tools, both architectures
-make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard,asep_cleaner,watchdog,scanner}.exe
+make x64      # -> build/x86_64/{lockdown_breaker,ransom_guard,asep_cleaner,watchdog,scanner,backup}.exe
 make arm64    # -> build/arm64/{...}.exe    (llvm-mingw Clang)
 ```
 
