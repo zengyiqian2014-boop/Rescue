@@ -306,6 +306,68 @@ static void addMember(FILE* out, const std::wstring& srcPath, const std::wstring
     ++g_files; g_orig += (uint64_t)sz.QuadPart; g_stored += e.storedBytes;
 }
 
+// Capture the boot/partition structures a front/back wipe destroys - the MBR
+// and GPT primary at the disk head (LBA 0..33) and the GPT backup at the disk
+// tail (last 33 sectors). Stored in the .rbk (off-disk) rather than gambled on
+// an "unused middle" sector that might not exist: a copy that lives in your
+// backup survives a front+back wipe AND a full wipe, unlike an on-disk copy.
+// Read-only; nothing is written to the disk.
+static void addRawMember(FILE* out, const std::vector<BYTE>& data, const std::wstring& rel) {
+    std::string relU8 = toUtf8(rel);
+    RbkEntry e{};
+    e.pathBytes = (uint32_t)relU8.size();
+    e.originalBytes = data.size();
+    e.kind = 3;   // boot/partition raw structure
+    std::vector<BYTE> comp; bool stored = true;
+    tryCompress(data, comp, stored);
+    if (stored) { e.compressed = 0; e.storedBytes = (uint32_t)data.size(); }
+    else        { e.compressed = 1; e.storedBytes = (uint32_t)comp.size(); }
+    fwrite(&e, sizeof(e), 1, out);
+    fwrite(relU8.data(), 1, relU8.size(), out);
+    if (stored) { if (!data.empty()) fwrite(data.data(), 1, data.size(), out); }
+    else        fwrite(comp.data(), 1, comp.size(), out);
+    ++g_files; g_orig += data.size(); g_stored += e.storedBytes;
+}
+
+static bool readDiskRegion(HANDLE h, LONGLONG off, DWORD bytes, std::vector<BYTE>& out) {
+    LARGE_INTEGER li; li.QuadPart = off;
+    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) return false;
+    out.resize(bytes);
+    DWORD got = 0;
+    return ReadFile(h, out.data(), bytes, &got, nullptr) && got == bytes;
+}
+
+static void captureBootStructures(FILE* out) {
+    for (int i = 0; i < 16; ++i) {
+        wchar_t dev[64]; swprintf(dev, 64, L"\\\\.\\PhysicalDrive%d", i);
+        HANDLE h = CreateFileW(dev, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+
+        // head: MBR + GPT primary header + partition entries = first 34 sectors
+        std::vector<BYTE> head;
+        if (readDiskRegion(h, 0, 34 * 512, head)) {
+            wchar_t rel[64]; swprintf(rel, 64, L"Boot\\PhysicalDrive%d.head", i);
+            addRawMember(out, head, rel);
+            wprintf(L"  boot struct: PhysicalDrive%d MBR + GPT (head)\n", i);
+        }
+        // tail: GPT backup = last 33 sectors (needs the disk length)
+        GET_LENGTH_INFORMATION li{};
+        DWORD ret = 0;
+        if (DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0,
+                            &li, sizeof(li), &ret, nullptr) && li.Length.QuadPart > 34 * 512) {
+            std::vector<BYTE> tail;
+            LONGLONG off = li.Length.QuadPart - 33 * 512;
+            if (readDiskRegion(h, off, 33 * 512, tail)) {
+                wchar_t rel[64]; swprintf(rel, 64, L"Boot\\PhysicalDrive%d.tail", i);
+                addRawMember(out, tail, rel);
+                wprintf(L"  boot struct: PhysicalDrive%d GPT backup (tail)\n", i);
+            }
+        }
+        CloseHandle(h);
+    }
+}
+
 static int doBackup(const std::wstring& outPath) {
     FILE* out = _wfopen(outPath.c_str(), L"wb");
     if (!out) { wprintf(L"[!] cannot create %ls\n", outPath.c_str()); return 1; }
@@ -352,6 +414,9 @@ static int doBackup(const std::wstring& outPath) {
         addMember(out, plist, L"Reference\\installed-programs.reg", 2);
         DeleteFileW(plist.c_str());
     }
+
+    // 5. boot/partition structures (MBR + GPT), so a front/back wipe is recoverable
+    captureBootStructures(out);
 
     // patch header counts
     hdr.entryCount = g_files;

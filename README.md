@@ -186,6 +186,21 @@ change. This is detection with a short poll-window race, complementing the shiel
 (prevention) and the rate monitor (bulk wipes): rate catches the batch wiper,
 the tripwire catches the boot/partition surgeon, the shield blocks both.
 
+**On decoy "buffer zones".** A tempting idea is to fill a large region at the
+front (or back) of the disk with sacrificial data so a *sequential* wiper spends
+tens of seconds chewing through it before it reaches real data — buying
+detection time (10 GB at 150 MB/s ≈ 68 s). The math is right, but it only helps
+against a strictly sequential front-to-back (or back-to-front) wiper — one that
+seeks straight to the data partition, or writes randomly, walks around it — it
+costs those gigabytes, and it can't be retrofitted safely on a live system
+(real data placement is the filesystem's, not ours; carving a decoy region in
+front of it means repartitioning). And the rate monitor already flags a bulk
+wiper in ~2 s, so the marginal benefit is small. The safe, effective form is an
+**install-time reserved decoy partition**, offered as optional hardening — not
+something the guard does to a live disk. What Rescue does instead is keep the
+boot structures backed up (above) so the wipe is *recoverable*, and detect +
+freeze fast.
+
 **What still needs the kernel (Module 6):** telling *which sectors* a write
 targets (to allow a legit write to a data region but block one to the MBR-GPT
 region) and per-write pre-blocking with a policy decision — that is the
@@ -348,6 +363,11 @@ user can actually change and cannot get back:
 - the **HKCU** registry hive (personalization, environment variables, file
   associations);
 - a reference list of installed programs, so you know what to reinstall.
+- the **boot/partition structures** (each disk's MBR + GPT primary at the head,
+  GPT backup at the tail) — so a surgical front/back wipe that destroys them is
+  recoverable from the backup. This copy lives **in the `.rbk` (off-disk)**, not
+  in an "unused middle sector" of the same disk: an off-disk copy survives a
+  front+back wipe *and* a full wipe, which an on-disk copy would not.
 
 **The container.** One self-describing `.rbk` file. Each member is stored
 compressed (Windows' built-in XPRESS_HUFF) *only when that is actually smaller* —
