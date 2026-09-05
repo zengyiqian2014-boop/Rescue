@@ -150,14 +150,26 @@ sustain; a **signed** one is not exempt but must sustain far longer before it
 trips — evidence proportional to trust. The response **suspends** the culprit,
 which is itself the user-mode "stop": a frozen process issues no more writes.
 
-**Honest limits (why this isn't the whole story):** user-mode I/O counters show
-how *much* a process wrote, not to *which* disk or *which* sectors — so telling
-"zeroing system disk 0 / hitting the MBR-GPT region" from "writing my USB stick"
-needs ETW Kernel-Disk (offset + disk number), and actually **blocking** a write
-to a critical block, or **locking a volume before damage lands**, needs the
-kernel minifilter (Module 6). This tier detects-and-freezes; it does not pretend
-to pre-block. Data already overwritten is gone regardless — only the offline
-backup (Module 7) survives that.
+**Prevention, not just detection — the disk write shield (`--shield`).** A
+raw-disk attacker (an MBR overwriter like MEMZ, a zero-fill wiper) must open
+`\\.\PhysicalDriveN` for *write*. If the guard opens the same device **first**
+with write-sharing denied (`FILE_SHARE_READ` only) and holds the handle, every
+later attempt to open it for write fails with a sharing violation — so the
+attacker never gets its write handle. That stops the overwrite *before* it
+happens, from user mode, no signing. It is best-effort and has real costs: if
+another component already holds the device with write access the restrictive
+open fails, and while the shield is up a *legitimate* disk tool is blocked too
+(stop the guard to use one). The live **system volume** still can't be locked
+outright (`FSCTL_LOCK_VOLUME` fails on it because the registry/pagefile keep
+handles open) — but shielding the raw *PhysicalDrive* handle covers the MBR/GPT
+and raw-sector vector that lock wouldn't anyway.
+
+**What still needs the kernel (Module 6):** telling *which sectors* a write
+targets (to allow a legit write to a data region but block one to the MBR-GPT
+region) and per-write pre-blocking with a policy decision — that is the
+minifilter's pre-operation callback. The shield is coarse (all-or-nothing on a
+device); the kernel filter is surgical. Data already overwritten is gone
+regardless — only the offline backup (Module 7) survives that.
 
 The one thing ETW still cannot do is **block** a write before it lands — only an
 in-kernel pre-write callback (Phase 6, signed driver) can. Attribution does not

@@ -376,6 +376,47 @@ static void massChangeMonitor(int threshold) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// disk write shield: pre-empt raw-disk overwrite (MBR wipers, zero-fillers)
+// ---------------------------------------------------------------------------
+// A raw-disk attacker (the MEMZ MBR overwrite, a zero-fill wiper) has to open
+// \\.\PhysicalDriveN for WRITE. If Rescue opens the same device FIRST with a
+// share mode that forbids write-sharing (FILE_SHARE_READ only) and holds the
+// handle, every later attempt to open it for write fails with a sharing
+// violation - so the wiper cannot get its write handle at all. This is
+// prevention, not detection: it stops the write before it happens, entirely
+// from user mode, no signing. It is best-effort: if another component already
+// holds the device with write access our restrictive open fails, and while the
+// shield is up a *legitimate* disk tool is blocked too (stop the guard to use
+// one). Held handles live for the life of the process.
+static std::vector<HANDLE> g_shieldHandles;
+
+static void acquireDiskShield() {
+    // Shield each physical drive present (0..15) plus the system volume's raw
+    // device. GENERIC_READ is enough to establish the handle; the point is the
+    // restrictive share mode, which denies others write access.
+    int shielded = 0;
+    for (int i = 0; i < 16; ++i) {
+        wchar_t path[64];
+        swprintf(path, 64, L"\\\\.\\PhysicalDrive%d", i);
+        HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            g_shieldHandles.push_back(h);
+            logline(L"disk shield: holding %ls (write access denied to others)", path);
+            ++shielded;
+        }
+    }
+    if (!shielded)
+        logline(L"[!] disk shield: could not hold any PhysicalDrive exclusively "
+                L"(another component may already have write access). Detection still active.");
+}
+
+static void releaseDiskShield() {
+    for (HANDLE h : g_shieldHandles) if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    g_shieldHandles.clear();
+}
+
 static std::wstring knownFolder(const wchar_t* env, const wchar_t* sub) {
     wchar_t buf[MAX_PATH]; DWORD n = GetEnvironmentVariableW(env, buf, MAX_PATH);
     if (!n || n >= MAX_PATH) return L"";
@@ -395,6 +436,9 @@ static void usage() {
         L"  --wiper-mbps <n>  raw write-rate (MB/s) from one process that counts as a\n"
         L"                    disk wiper - catches raw-disk zero-fillers the file\n"
         L"                    watcher can't see (default 150)\n"
+        L"  --shield          PREVENT raw-disk overwrite: hold \\\\.\\PhysicalDriveN with\n"
+        L"                    write-sharing denied, so a wiper/MBR-overwriter can't get\n"
+        L"                    a write handle. Blocks legit disk tools too while active.\n"
         L"  --kill            KILL the culprit instead of suspending it (irreversible)\n"
         L"  -h, --help        this help\n\n"
         L"Leave it running. On a trip it suspends the busiest writer's process tree\n"
@@ -405,11 +449,13 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<std::wstring> dirs;
     int threshold = 40;
     int rawMbPerSec = 150;   // raw-write rate that counts as a wiper
+    bool shield = false;
     for (int i = 1; i < argc; ++i) {
         if (!_wcsicmp(argv[i], L"--watch") && i + 1 < argc) dirs.push_back(argv[++i]);
         else if (!_wcsicmp(argv[i], L"--threshold") && i + 1 < argc) threshold = _wtoi(argv[++i]);
         else if (!_wcsicmp(argv[i], L"--kill")) g_kill = true;
         else if (!_wcsicmp(argv[i], L"--wiper-mbps") && i + 1 < argc) rawMbPerSec = _wtoi(argv[++i]);
+        else if (!_wcsicmp(argv[i], L"--shield")) shield = true;
         else if (!_wcsicmp(argv[i], L"-h") || !_wcsicmp(argv[i], L"--help")) { usage(); return 0; }
         else { wprintf(L"unknown option: %ls\n\n", argv[i]); usage(); return 2; }
     }
@@ -438,6 +484,7 @@ int wmain(int argc, wchar_t** argv) {
         logline(L"watching: %ls", d.c_str());
     }
     logline(L"canaries planted: %zu   attack threshold: %d files/sec", g_canaries.size(), threshold);
+    if (shield) acquireDiskShield();
     logline(L"guard is live. Leave this window open. Ctrl+C to stop.");
 
     std::vector<std::thread> pool;
@@ -445,6 +492,7 @@ int wmain(int argc, wchar_t** argv) {
     pool.emplace_back(massChangeMonitor, threshold);
     pool.emplace_back(rawWriteMonitor, rawMbPerSec);
     for (auto& t : pool) t.join();
+    releaseDiskShield();
     g_etw.Stop();
     return 0;
 }
