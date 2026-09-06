@@ -86,7 +86,8 @@ static void loadBundledFonts(HINSTANCE hInst){
 enum {
     A_NONE=0, A_QUICK, A_FULL, A_USB, A_GUARD_TGL, A_UNLOCK, A_ASEP, A_BACKUP,
     A_QUAR_OPEN, A_NAV_DASH, A_NAV_GUARD, A_NAV_SCAN, A_NAV_QUAR, A_NAV_USB,
-    A_NAV_LOGS, A_NAV_SET
+    A_NAV_LOGS, A_NAV_SET, A_NAV_KERNEL,
+    A_KERNEL_AUDIT, A_KERNEL_ENFORCE, A_KERNEL_RESTORE
 };
 
 struct Hit { RECT rc; int action; };
@@ -99,7 +100,7 @@ struct Event { Sev sev; std::wstring title, detail, ago; };
 static std::deque<Event> gFeed;
 
 // which page the content area shows
-enum { VIEW_DASH, VIEW_SCAN, VIEW_QUAR, VIEW_GUARD, VIEW_USB, VIEW_LOGS, VIEW_SET };
+enum { VIEW_DASH, VIEW_SCAN, VIEW_QUAR, VIEW_GUARD, VIEW_USB, VIEW_LOGS, VIEW_SET, VIEW_KERNEL };
 static int gView=VIEW_DASH;
 
 static HWND gWnd=nullptr;
@@ -122,6 +123,32 @@ static std::wstring exeDir(){ wchar_t b[MAX_PATH*2]; GetModuleFileNameW(nullptr,
 static std::wstring tool(const wchar_t* n){ return L"\""+exeDir()+L"\\"+n+L"\""; }
 static std::wstring pdRescue(){ wchar_t b[MAX_PATH*2]; DWORD n=GetEnvironmentVariableW(L"ProgramData",b,MAX_PATH*2);
     return (n?std::wstring(b):L"C:\\ProgramData")+L"\\Rescue"; }
+
+// Locate the bundled "advanced" kit (scripts + driver) next to the exe.
+static std::wstring advBase(){
+    std::wstring a=exeDir()+L"\\..\\advanced";
+    if(GetFileAttributesW(a.c_str())!=INVALID_FILE_ATTRIBUTES) return a;
+    a=exeDir()+L"\\advanced";
+    if(GetFileAttributesW(a.c_str())!=INVALID_FILE_ATTRIBUTES) return a;
+    return exeDir();
+}
+// Run one of the kernel-CI PowerShell scripts in a visible console (we are
+// already elevated, so it inherits admin; a window lets the user read the
+// itemised consent and type it). Scripts live under advanced\installer and act
+// on the driver under advanced\driver.
+static void runKernelScript(const wchar_t* scriptName,const wchar_t* extraArgs){
+    std::wstring adv=advBase();
+    std::wstring script=adv+L"\\installer\\"+scriptName;
+    std::wstring drv=adv+L"\\driver";
+    if(GetFileAttributesW(script.c_str())==INVALID_FILE_ATTRIBUTES){
+        MessageBoxW(gWnd,(L"Script not found:\n"+script+L"\n\nIt ships in the advanced\\installer folder next to Rescue.exe.").c_str(),
+            L"Kernel protection",MB_ICONWARNING); return;
+    }
+    std::wstring args=L"-NoExit -ExecutionPolicy Bypass -File \""+script+L"\" "
+        L"-SysPath \""+drv+L"\\rescuemon.sys\" -InfPath \""+drv+L"\\rescuemon.inf\" ";
+    if(extraArgs) args+=extraArgs;
+    ShellExecuteW(gWnd,L"open",L"powershell.exe",args.c_str(),drv.c_str(),SW_SHOWNORMAL);
+}
 
 static void feedAdd(Sev s,const std::wstring& t,const std::wstring& d){
     gFeed.push_front({s,t,d,L"now"}); if(gFeed.size()>40) gFeed.pop_back();
@@ -205,6 +232,14 @@ static void doAction(int a){
     case A_NAV_USB:  gView=VIEW_USB; break;
     case A_NAV_LOGS: gView=VIEW_LOGS; break;
     case A_NAV_SET:  gView=VIEW_SET; break;
+    case A_NAV_KERNEL: gView=VIEW_KERNEL; break;
+    // ---- kernel Code-Integrity enablement (opt-in, reversible) ----
+    case A_KERNEL_AUDIT: feedAdd(EV_INFO,L"Kernel CI: audit",L"Deploying custom CI in audit mode (blocks nothing)");
+        runKernelScript(L"Enable-KernelCI.ps1",nullptr); break;
+    case A_KERNEL_ENFORCE: feedAdd(EV_WARN,L"Kernel CI: enforce",L"Deploying custom CI in enforce mode + loading driver");
+        runKernelScript(L"Enable-KernelCI.ps1",L"-Enforce"); break;
+    case A_KERNEL_RESTORE: feedAdd(EV_INFO,L"Kernel CI: restore",L"Removing custom CI, restoring original configuration");
+        runKernelScript(L"Restore-KernelCI.ps1",nullptr); break;
     // ---- actions ----
     case A_QUICK: gView=VIEW_SCAN; startScan(false); break;
     case A_FULL:  gView=VIEW_SCAN; startScan(true); break;
@@ -442,6 +477,31 @@ static void drawGuardPage(HDC dc,int cx,int cy,int cw,RECT cr){
     RECT bt={hx,c.top+164,hx+186,c.top+204}; pageBtn(dc,bt,gGuardOn?L"Turn off guard":L"Turn on guard",A_GUARD_TGL,!gGuardOn);
     RECT act={cx,c.bottom+pad,cx+cw,cr.bottom-pad}; if(act.bottom-act.top>120) drawFeedCard(dc,act);
 }
+static void drawKernelPage(HDC dc,int cx,int cy,int cw,RECT cr){
+    int pad=24; RECT c={cx,cy,cx+cw,cy+322}; card(dc,c,CPANEL,CLINE,14);
+    RECT ic={c.left+22,c.top+22,c.left+62,c.top+62}; card(dc,ic,CACCD,RGB(0x22,0x37,0x5c),10);
+    { RECT ii={ic.left+9,ic.top+9,ic.right-9,ic.bottom-9}; drawIcon(dc,L"cpu",ii,CACC2); }
+    RECT ti={c.left+74,c.top+20,c.right-24,c.top+50};
+    txt(dc,L"Kernel Filter — un-killable tier",ti,fDisp,CINK,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    RECT eb={c.left+74,c.top+52,c.right-24,c.top+72};
+    txt(dc,L"OPTIONAL · OFF BY DEFAULT · REVERSIBLE",eb,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
+    // explanation
+    RECT ds={c.left+24,c.top+84,c.right-24,c.top+186};
+    txt(dc,L"The minifilter vets every write in the kernel I/O path — the one tier user mode "
+           L"cannot do. Loading an unsigned driver needs authorization. This deploys a custom "
+           L"Code-Integrity policy that allows only this driver's hash; everything else stays on "
+           L"the Microsoft default. It never deletes your CI (backs up to .bak) and never touches "
+           L"Secure Boot or Memory Integrity.\n"
+           L"Start with Audit (blocks nothing, only logs). If HVCI/Memory Integrity is on, an "
+           L"unsigned driver still won't load — that needs Microsoft signing.",
+        ds,fSansS,CMUT,DT_LEFT|DT_WORDBREAK);
+    // buttons row
+    int by=c.bottom-52;
+    RECT b1={c.left+24,by,c.left+204,by+40}; pageBtn(dc,b1,L"Enable (audit)",A_KERNEL_AUDIT,true);
+    RECT b2={c.left+216,by,c.left+392,by+40}; pageBtn(dc,b2,L"Enable (enforce)",A_KERNEL_ENFORCE,false);
+    RECT b3={c.left+404,by,c.left+588,by+40}; pageBtn(dc,b3,L"Restore original CI",A_KERNEL_RESTORE,false);
+    RECT act={cx,c.bottom+pad,cx+cw,cr.bottom-pad}; if(act.bottom-act.top>120) drawFeedCard(dc,act);
+}
 static void drawSimplePage(HDC dc,int cx,int cy,int cw,RECT cr,const wchar_t* icon,const wchar_t* title,const wchar_t* desc,const wchar_t* btn,int action){
     RECT c={cx,cy,cx+cw,cy+204}; card(dc,c,CPANEL,CLINE,14);
     RECT ic={c.left+22,c.top+22,c.left+62,c.top+62}; card(dc,ic,CACCD,RGB(0x22,0x37,0x5c),10);
@@ -483,7 +543,7 @@ static void paint(HWND hwnd){
     int X=RAIL, W=cr.right-RAIL;
     RECT top={X,0,cr.right,58}; fillR(dc,top,CBG2);
     RECT tl={X,57,cr.right,58}; fillR(dc,tl,CLINE);
-    const wchar_t* vt[]={L"Dashboard",L"Scan",L"Quarantine",L"Real-time Guard",L"Rescue USB",L"Activity Log",L"Settings"};
+    const wchar_t* vt[]={L"Dashboard",L"Scan",L"Quarantine",L"Real-time Guard",L"Rescue USB",L"Activity Log",L"Settings",L"Kernel Filter"};
     RECT th={X+26,0,X+360,58}; txt(dc,vt[gView],th,fDispS,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     wchar_t clock[32]; SYSTEMTIME st; GetLocalTime(&st); wsprintfW(clock,L"%02d:%02d:%02d",st.wHour,st.wMinute,st.wSecond);
     RECT tc={cr.right-140,0,cr.right-58,58}; txt(dc,clock,tc,fMono,CMUT,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
@@ -501,6 +561,7 @@ static void paint(HWND hwnd){
         L"WinPE boot media, or a one-click restore disk from an official Windows ISO plus your backup. "
         L"The kit stays as PowerShell on purpose: if malware blocks .exe files via system policy, the .ps1 kit still runs.",
         L"Open emergency kit",A_USB); }
+    else if(gView==VIEW_KERNEL){ drawKernelPage(dc,cx,y,cw,cr); }
     else if(gView==VIEW_LOGS){ RECT act={cx,y,cx+cw,cr.bottom-pad}; drawFeedCard(dc,act); }
     else if(gView==VIEW_SET){ drawSimplePage(dc,cx,y,cw,cr,L"gear",L"Settings",
         L"Rescue runs elevated so it can touch OS-protected files and HKLM policy keys. "
@@ -569,7 +630,7 @@ static void paint(HWND hwnd){
         {L"asep",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP, L"Ready", L"Review"},
         {L"search",L"Threat Scanner",L"Heuristic + hash + quarantine", L"PE entropy \u00b7 MOTW priority", L"Downloads deep-scanned first", 0, L"Updated", A_QUICK, L"Ready", L"Scan"},
         {L"dog",L"Watchdog",L"Self-protecting service pair", L"Two services \u00b7 each restarts the other", L"Keeps Ransom Guard alive", 0, L"Ready", A_BACKUP, L"Paired", L"Back up"},
-        {L"cpu",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Requires a signed driver to load", 3, L"Not installed", A_NONE, L"Phase 6", L"Learn why"},
+        {L"cpu",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Custom CI policy \u00b7 opt-in \u00b7 reversible", 3, L"Optional", A_NAV_KERNEL, L"Off by default", L"Manage"},
     };
     mods[2].chipKind=0; // asep neutral unless flagged
     int cols=3, gap=14; int mw=(cw-gap*(cols-1))/cols, mh=124;
@@ -636,6 +697,7 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,PWSTR,int nShow){
       else if(cl.find(L"--view=usb")!=std::wstring::npos) gView=VIEW_USB;
       else if(cl.find(L"--view=logs")!=std::wstring::npos) gView=VIEW_LOGS;
       else if(cl.find(L"--view=settings")!=std::wstring::npos) gView=VIEW_SET;
+      else if(cl.find(L"--view=kernel")!=std::wstring::npos) gView=VIEW_KERNEL;
       if(cl.find(L"--demo")!=std::wstring::npos){ // render-preview only (screenshots)
           gScanning=true; gScanFull=false; gScanPct=63; gScanCount=18452; gScanPath=L"C:\\Users\\me\\Downloads"; }
     }

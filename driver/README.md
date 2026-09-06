@@ -66,6 +66,34 @@ reason this tier isn't already shipping.
    ```
    Output: `rescuemon.sys`.
 
+### Building on Linux (clang + WDK NuGet, no Visual Studio)
+
+`tools/build-driver.sh` cross-compiles `rescuemon.sys` on Linux: it pulls the
+Microsoft WDK kernel headers/libs from their NuGet packages
+(`Microsoft.Windows.WDK.x64` + `Microsoft.Windows.SDK.cpp`) and builds with
+clang (`--target=x86_64-pc-windows-msvc`, `/guard:cf /integritycheck`) and
+`lld-link` (`/DRIVER /SUBSYSTEM:NATIVE /ENTRY:GsDriverEntry`). The result is a
+correctly-formed native x64 minifilter that imports `ntoskrnl.exe` + `FLTMGR.SYS`.
+It is **unsigned** (still needs signing to load — see below) and has **not** been
+run on a live kernel; building validates types/ABI against the real WDK headers,
+not runtime behaviour.
+
+### Enabling it without buying an EV certificate
+
+Two opt-in, reversible helpers deploy the driver on a machine you own:
+
+- `installer/Enable-KernelCI.ps1` — a custom WDAC / Code-Integrity policy that
+  allow-lists *this driver's hash* on top of the AllowMicrosoft base ("only our
+  sys, everything else Microsoft"). Deploys in **audit** mode by default;
+  `-Enforce` arms it. Loads the unsigned driver only where **Memory Integrity
+  (HVCI) is off**; it never changes Secure Boot / HVCI, backs up existing policy
+  to `.bak`, and `installer/Restore-KernelCI.ps1` reverses everything.
+- `installer/Install-RescueDriver.ps1 -LabMode` — the test-signing path
+  (Secure Boot off), unchanged.
+
+Both are also reachable from the app: **Kernel Filter** page →
+Enable (audit) / Enable (enforce) / Restore original CI.
+
 ## Loading it (signing is mandatory, and self-signing is not enough)
 
 64-bit Windows will not load an unsigned kernel driver — and, importantly, it
