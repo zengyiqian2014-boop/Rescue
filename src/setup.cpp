@@ -106,6 +106,26 @@ static void regArp(const std::wstring& dir){
     RegCloseKey(k);
 }
 
+// ---- run a bundled PowerShell step HIDDEN (no separate console the user has to
+//      babysit); returns its exit code. The engine stays PowerShell because WDAC
+//      policy authoring needs the system ConfigCI module, but the user only ever
+//      sees this installer. -----------------------------------------------------
+static DWORD runHidden(const std::wstring& psArgs,const std::wstring& cwd){
+    std::wstring cmd=L"powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass "+psArgs;
+    STARTUPINFOW si{}; si.cb=sizeof(si); si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
+    PROCESS_INFORMATION pi{}; std::vector<wchar_t> m(cmd.begin(),cmd.end()); m.push_back(0);
+    if(!CreateProcessW(nullptr,m.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,
+        cwd.empty()?nullptr:cwd.c_str(),&si,&pi)) return (DWORD)-1;
+    CloseHandle(pi.hThread); WaitForSingleObject(pi.hProcess,INFINITE);
+    DWORD rc=0; GetExitCodeProcess(pi.hProcess,&rc); CloseHandle(pi.hProcess); return rc;
+}
+static void setRunOnce(const std::wstring& name,const std::wstring& cmd){
+    HKEY k; if(RegCreateKeyExW(HKEY_LOCAL_MACHINE,L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        0,nullptr,0,KEY_WRITE,nullptr,&k,nullptr)==ERROR_SUCCESS){
+        RegSetValueExW(k,name.c_str(),0,REG_SZ,(const BYTE*)cmd.c_str(),(DWORD)((cmd.size()+1)*sizeof(wchar_t)));
+        RegCloseKey(k); }
+}
+
 // ---- the install itself ------------------------------------------------------
 static void doInstall(bool enableKernel,bool desktop){
     EnableWindow(gBtnInstall,FALSE); EnableWindow(gChkKernel,FALSE); EnableWindow(gChkDesktop,FALSE);
@@ -130,12 +150,31 @@ static void doInstall(bool enableKernel,bool desktop){
     regArp(gInstallDir);
 
     if(enableKernel){
-        setStatus(L"Launching kernel protection setup ...");
-        std::wstring script=gInstallDir+L"\\advanced\\installer\\Enable-KernelCI.ps1";
-        std::wstring drv=gInstallDir+L"\\advanced\\driver";
-        if(GetFileAttributesW(script.c_str())!=INVALID_FILE_ATTRIBUTES){
-            std::wstring args=L"-NoExit -ExecutionPolicy Bypass -File \""+script+L"\" -SysPath \""+drv+L"\\rescuemon.sys\" -InfPath \""+drv+L"\\rescuemon.inf\"";
-            ShellExecuteW(gWnd,L"open",L"powershell.exe",args.c_str(),drv.c_str(),SW_SHOWNORMAL);
+        int r=MessageBoxW(gWnd,
+            L"Enable the kernel protection tier now?\n\n"
+            L"Rescue will:\n"
+            L"  \u2022 self-sign the RescueMon driver and deploy a custom Code-Integrity\n"
+            L"    policy that allows only it (everything else stays on the Microsoft\n"
+            L"    default), in AUDIT mode first;\n"
+            L"  \u2022 if Memory Integrity (HVCI) is on, turn it OFF (an unsigned driver\n"
+            L"    cannot load otherwise) \u2014 this is reversible and lowers kernel-memory\n"
+            L"    protection for all drivers until you restore it;\n"
+            L"  \u2022 after you reboot, finish automatically (verify the audit log, then\n"
+            L"    enforce) \u2014 no scripts to run yourself.\n\n"
+            L"You can also do this later from Rescue > Kernel Filter, and undo it any\n"
+            L"time with Restore. Proceed now?",
+            L"Kernel protection (optional)",MB_YESNO|MB_ICONWARNING);
+        if(r==IDYES){
+            setStatus(L"Enabling kernel protection (step 1) ...");
+            std::wstring drv=gInstallDir+L"\\advanced\\driver";
+            std::wstring script=gInstallDir+L"\\advanced\\installer\\Enable-KernelCI.ps1";
+            std::wstring a=L"-File \""+script+L"\" -Force -SysPath \""+drv+L"\\rescuemon.sys\" -InfPath \""+drv+L"\\rescuemon.inf\"";
+            DWORD rc=runHidden(a,drv);
+            // Rescue.exe --kernel-enforce finishes step 2 automatically after reboot.
+            setRunOnce(L"RescueKernelEnforce",L"\""+gInstallDir+L"\\Rescue.exe\" --kernel-enforce");
+            setStatus(rc==0
+                ? L"Kernel protection staged. Reboot to finish \u2014 Rescue completes it automatically."
+                : L"Installed. Kernel step 1 hit an issue (needs Win Pro/Enterprise for WDAC); see Rescue > Kernel Filter.");
         }
     }
     setStatus(L"Done. Rescue is installed in "+gInstallDir+L".");

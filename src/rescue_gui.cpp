@@ -132,22 +132,31 @@ static std::wstring advBase(){
     if(GetFileAttributesW(a.c_str())!=INVALID_FILE_ATTRIBUTES) return a;
     return exeDir();
 }
-// Run one of the kernel-CI PowerShell scripts in a visible console (we are
-// already elevated, so it inherits admin; a window lets the user read the
-// itemised consent and type it). Scripts live under advanced\installer and act
-// on the driver under advanced\driver.
-static void runKernelScript(const wchar_t* scriptName,const wchar_t* extraArgs){
+// Run one of the kernel-CI PowerShell steps HIDDEN and wait for it. The engine
+// stays PowerShell (WDAC authoring needs the system ConfigCI module), but the
+// user only ever sees Rescue's own dialogs - no script windows to click through.
+// Returns the step's exit code ((DWORD)-1 if it could not start).
+static DWORD runKernelPS(const wchar_t* scriptName,const wchar_t* extraArgs){
     std::wstring adv=advBase();
     std::wstring script=adv+L"\\installer\\"+scriptName;
     std::wstring drv=adv+L"\\driver";
     if(GetFileAttributesW(script.c_str())==INVALID_FILE_ATTRIBUTES){
-        MessageBoxW(gWnd,(L"Script not found:\n"+script+L"\n\nIt ships in the advanced\\installer folder next to Rescue.exe.").c_str(),
-            L"Kernel protection",MB_ICONWARNING); return;
+        MessageBoxW(gWnd,(L"Component not found:\n"+script).c_str(),L"Kernel protection",MB_ICONWARNING); return (DWORD)-1;
     }
-    std::wstring args=L"-NoExit -ExecutionPolicy Bypass -File \""+script+L"\" "
+    std::wstring cmd=L"powershell.exe -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \""+script+L"\" "
         L"-SysPath \""+drv+L"\\rescuemon.sys\" -InfPath \""+drv+L"\\rescuemon.inf\" ";
-    if(extraArgs) args+=extraArgs;
-    ShellExecuteW(gWnd,L"open",L"powershell.exe",args.c_str(),drv.c_str(),SW_SHOWNORMAL);
+    if(extraArgs) cmd+=extraArgs;
+    STARTUPINFOW si{}; si.cb=sizeof(si); si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
+    PROCESS_INFORMATION pi{}; std::vector<wchar_t> m(cmd.begin(),cmd.end()); m.push_back(0);
+    if(!CreateProcessW(nullptr,m.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,drv.c_str(),&si,&pi)) return (DWORD)-1;
+    CloseHandle(pi.hThread); WaitForSingleObject(pi.hProcess,INFINITE);
+    DWORD rc=0; GetExitCodeProcess(pi.hProcess,&rc); CloseHandle(pi.hProcess); return rc;
+}
+static void setRunOnce(const std::wstring& name,const std::wstring& cmd){
+    HKEY k; if(RegCreateKeyExW(HKEY_LOCAL_MACHINE,L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        0,nullptr,0,KEY_WRITE,nullptr,&k,nullptr)==ERROR_SUCCESS){
+        RegSetValueExW(k,name.c_str(),0,REG_SZ,(const BYTE*)cmd.c_str(),(DWORD)((cmd.size()+1)*sizeof(wchar_t)));
+        RegCloseKey(k); }
 }
 
 static void feedAdd(Sev s,const std::wstring& t,const std::wstring& d){
@@ -234,14 +243,48 @@ static void doAction(int a){
     case A_NAV_SET:  gView=VIEW_SET; break;
     case A_NAV_KERNEL: gView=VIEW_KERNEL; break;
     // ---- kernel Code-Integrity enablement (opt-in, reversible) ----
-    case A_KERNEL_AUDIT: feedAdd(EV_INFO,L"Kernel CI: audit",L"Deploying custom CI in audit mode (blocks nothing)");
-        runKernelScript(L"Enable-KernelCI.ps1",nullptr); break;
-    case A_KERNEL_ENFORCE: feedAdd(EV_WARN,L"Kernel CI: enforce",L"Deploying custom CI in enforce mode + loading driver");
-        runKernelScript(L"Enable-KernelCI.ps1",L"-Enforce"); break;
-    case A_KERNEL_ENFORCE_NOHVCI: feedAdd(EV_CRIT,L"Kernel CI: enforce + HVCI off",L"Enforce + turn off Memory Integrity (asks for typed consent)");
-        runKernelScript(L"Enable-KernelCI.ps1",L"-Enforce -DisableHVCI"); break;
-    case A_KERNEL_RESTORE: feedAdd(EV_INFO,L"Kernel CI: restore",L"Removing custom CI, restoring original configuration");
-        runKernelScript(L"Restore-KernelCI.ps1",nullptr); break;
+    case A_KERNEL_AUDIT:{
+        if(MessageBoxW(gWnd,
+            L"Turn on the kernel protection tier?\n\n"
+            L"Rescue will self-sign the RescueMon driver, deploy a custom Code-Integrity "
+            L"policy that allows only it (everything else stays Microsoft-default) in audit "
+            L"mode, and \u2014 if Memory Integrity (HVCI) is on \u2014 turn it off (reversible, "
+            L"lowers kernel-memory protection until restored). After you reboot, Rescue "
+            L"finishes automatically (verifies the audit log, then enforces). No scripts to run.\n\n"
+            L"Proceed?",L"Turn on kernel protection",MB_YESNO|MB_ICONWARNING)!=IDYES) break;
+        feedAdd(EV_INFO,L"Kernel protection",L"Enabling (step 1) in the background \u2026");
+        std::thread([]{
+            DWORD rc=runKernelPS(L"Enable-KernelCI.ps1",L"-Force");
+            setRunOnce(L"RescueKernelEnforce",L"\""+exeDir()+L"\\Rescue.exe\" --kernel-enforce");
+            feedAdd(rc==0?EV_OK:EV_WARN,L"Kernel protection staged",
+                rc==0?L"Reboot to finish \u2014 Rescue completes step 2 automatically":L"Step 1 issue (WDAC needs Windows Pro/Enterprise)");
+            MessageBoxW(gWnd, rc==0?
+                L"Kernel protection staged.\n\nReboot to finish \u2014 Rescue completes it automatically after restart.":
+                L"Could not complete step 1.\n\nWDAC policy authoring needs Windows Pro/Enterprise (ConfigCI).",
+                L"Kernel protection", rc==0?MB_ICONINFORMATION:MB_ICONWARNING);
+            if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
+        }).detach(); break; }
+    case A_KERNEL_ENFORCE:{
+        feedAdd(EV_INFO,L"Kernel protection",L"Verifying audit log, then enforcing if clean \u2026");
+        std::thread([]{
+            DWORD rc=runKernelPS(L"Enable-KernelCI.ps1",L"-CheckEnforce");
+            feedAdd(rc==0?EV_OK:EV_WARN,L"Kernel protection",
+                rc==0?L"Enforced \u2014 driver loaded":L"Not enforced (audit found drivers that would be blocked, or reboot needed)");
+            MessageBoxW(gWnd, rc==0?L"Kernel protection is now enforced and the driver is loaded.":
+                L"Not enforced.\n\nEither the audit log shows drivers that would be blocked, or a reboot is still needed. See Rescue > Activity.",
+                L"Kernel protection", rc==0?MB_ICONINFORMATION:MB_ICONWARNING);
+            if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
+        }).detach(); break; }
+    case A_KERNEL_RESTORE:{
+        if(MessageBoxW(gWnd,L"Restore the original Code-Integrity configuration?\n\nRemoves Rescue's custom policy, re-enables Memory Integrity if Rescue turned it off, unloads the driver, and removes the self-signed certificate.",
+            L"Restore original CI",MB_YESNO|MB_ICONQUESTION)!=IDYES) break;
+        feedAdd(EV_INFO,L"Kernel protection",L"Restoring original configuration \u2026");
+        std::thread([]{
+            DWORD rc=runKernelPS(L"Restore-KernelCI.ps1",nullptr);
+            feedAdd(EV_OK,L"Kernel protection",rc==0?L"Original CI restored":L"Restore finished with warnings");
+            MessageBoxW(gWnd,L"Original Code-Integrity configuration restored.\nReboot to fully clear the policy.",L"Restore original CI",MB_ICONINFORMATION);
+            if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
+        }).detach(); break; }
     // ---- actions ----
     case A_QUICK: gView=VIEW_SCAN; startScan(false); break;
     case A_FULL:  gView=VIEW_SCAN; startScan(true); break;
@@ -490,19 +533,18 @@ static void drawKernelPage(HDC dc,int cx,int cy,int cw,RECT cr){
     // explanation
     RECT ds={c.left+24,c.top+84,c.right-24,c.top+186};
     txt(dc,L"The minifilter vets every write in the kernel I/O path — the one tier user mode "
-           L"cannot do. Loading an unsigned driver needs authorization. This deploys a custom "
-           L"Code-Integrity policy that allows only this driver's hash; everything else stays on "
-           L"the Microsoft default. It never deletes your CI (backs up to .bak) and never touches "
-           L"Secure Boot or Memory Integrity.\n"
-           L"Start with Audit (blocks nothing, only logs). If HVCI/Memory Integrity is on, an "
-           L"unsigned driver still won't load — that needs Microsoft signing.",
+           L"cannot do. Click “Turn on protection”: Rescue signs the driver, deploys a custom "
+           L"Code-Integrity policy allowing only its hash (everything else stays Microsoft-default), "
+           L"and turns Memory Integrity off if needed — one confirmation, no scripts. Reboot and it "
+           L"finishes on its own (verifies the audit log, then enforces).\n"
+           L"“Verify & enforce” is a manual fallback for that second step. “Restore original CI” "
+           L"undoes everything (re-enables HVCI, keeps your CI via .bak). Never touches Secure Boot.",
         ds,fSansS,CMUT,DT_LEFT|DT_WORDBREAK);
     // buttons row
     int by=c.bottom-52;
-    RECT b1={c.left+24,by,c.left+178,by+40};  pageBtn(dc,b1,L"Enable (audit)",A_KERNEL_AUDIT,true);
-    RECT b2={c.left+190,by,c.left+304,by+40}; pageBtn(dc,b2,L"Enforce",A_KERNEL_ENFORCE,false);
-    RECT b3={c.left+316,by,c.left+498,by+40}; pageBtn(dc,b3,L"Enforce · HVCI off",A_KERNEL_ENFORCE_NOHVCI,false);
-    RECT b4={c.left+510,by,c.left+664,by+40}; pageBtn(dc,b4,L"Restore CI",A_KERNEL_RESTORE,false);
+    RECT b1={c.left+24,by,c.left+250,by+40};  pageBtn(dc,b1,L"1 · Turn on protection",A_KERNEL_AUDIT,true);
+    RECT b2={c.left+262,by,c.left+458,by+40}; pageBtn(dc,b2,L"2 · Verify & enforce",A_KERNEL_ENFORCE,false);
+    RECT b3={c.left+470,by,c.left+648,by+40}; pageBtn(dc,b3,L"Restore original CI",A_KERNEL_RESTORE,false);
     RECT act={cx,c.bottom+pad,cx+cw,cr.bottom-pad}; if(act.bottom-act.top>120) drawFeedCard(dc,act);
 }
 static void drawSimplePage(HDC dc,int cx,int cy,int cw,RECT cr,const wchar_t* icon,const wchar_t* title,const wchar_t* desc,const wchar_t* btn,int action){
@@ -703,6 +745,7 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,PWSTR,int nShow){
       else if(cl.find(L"--view=kernel")!=std::wstring::npos) gView=VIEW_KERNEL;
       if(cl.find(L"--demo")!=std::wstring::npos){ // render-preview only (screenshots)
           gScanning=true; gScanFull=false; gScanPct=63; gScanCount=18452; gScanPath=L"C:\\Users\\me\\Downloads"; }
+      if(cl.find(L"--kernel-enforce")!=std::wstring::npos) gView=VIEW_KERNEL;
     }
     HICON hIcBig=(HICON)LoadImageW(hInst,MAKEINTRESOURCEW(IDI_APPICON),IMAGE_ICON,0,0,LR_DEFAULTSIZE);
     HICON hIcSm =(HICON)LoadImageW(hInst,MAKEINTRESOURCEW(IDI_APPICON),IMAGE_ICON,16,16,0);
@@ -714,6 +757,18 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,PWSTR,int nShow){
     if(hIcBig) SendMessageW(gWnd,WM_SETICON,ICON_BIG,(LPARAM)hIcBig);
     if(hIcSm)  SendMessageW(gWnd,WM_SETICON,ICON_SMALL,(LPARAM)hIcSm);
     ShowWindow(gWnd,nShow); UpdateWindow(gWnd);
+    // RunOnce after a reboot lands here: finish kernel step 2 automatically.
+    if(std::wstring(GetCommandLineW()).find(L"--kernel-enforce")!=std::wstring::npos){
+        std::thread([]{
+            DWORD rc=runKernelPS(L"Enable-KernelCI.ps1",L"-CheckEnforce");
+            feedAdd(rc==0?EV_OK:EV_WARN,L"Kernel protection",
+                rc==0?L"Enforced automatically after reboot — driver loaded":L"Auto-finish: audit found blockers or reboot needed");
+            MessageBoxW(gWnd, rc==0?L"Kernel protection finished setting up and is now active.":
+                L"Kernel protection could not auto-enforce (the audit log shows drivers that would be blocked, or another reboot is needed). Open Rescue > Kernel Filter to review.",
+                L"Kernel protection", rc==0?MB_ICONINFORMATION:MB_ICONWARNING);
+            if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
+        }).detach();
+    }
     MSG m; while(GetMessageW(&m,nullptr,0,0)>0){ TranslateMessage(&m); DispatchMessageW(&m); }
     return 0;
 }
