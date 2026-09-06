@@ -19,6 +19,26 @@
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+// Bundled-font resource ids (must match src/rescue_gui.rc).
+#define IDF_SORA_SB   101   // Sora SemiBold  -> "Sora SemiBold"
+#define IDF_SORA_XB   102   // Sora ExtraBold -> "Sora ExtraBold"
+#define IDF_PLEX_RG   103   // IBM Plex Sans  -> "IBM Plex Sans"
+#define IDF_PLEX_SB   104   // IBM Plex Sans SemiBold -> "IBM Plex Sans SemiBold"
+#define IDF_PLEXMONO  105   // IBM Plex Mono  -> "IBM Plex Mono"
+
+// Load the embedded UI fonts privately for this process (no install needed),
+// so the console renders with its intended type - Sora + IBM Plex - on any
+// machine, exactly like the design, instead of falling back to a system face.
+static void loadBundledFonts(HINSTANCE hInst){
+    const int ids[]={IDF_SORA_SB,IDF_SORA_XB,IDF_PLEX_RG,IDF_PLEX_SB,IDF_PLEXMONO};
+    for(int id:ids){
+        HRSRC r=FindResourceW(hInst,MAKEINTRESOURCEW(id),RT_RCDATA); if(!r) continue;
+        HGLOBAL h=LoadResource(hInst,r); if(!h) continue;
+        void* p=LockResource(h); DWORD sz=SizeofResource(hInst,r);
+        if(p&&sz){ DWORD n=0; AddFontMemResourceEx(p,sz,nullptr,&n); }
+    }
+}
+
 // ------------------------------------------------------------- palette (dark)-
 #define CBG      RGB(0x0a,0x0e,0x16)
 #define CBG2     RGB(0x0d,0x12,0x20)
@@ -55,16 +75,23 @@ enum Sev { EV_OK, EV_WARN, EV_CRIT, EV_INFO };
 struct Event { Sev sev; std::wstring title, detail, ago; };
 static std::deque<Event> gFeed;
 
+// which page the content area shows
+enum { VIEW_DASH, VIEW_SCAN, VIEW_QUAR, VIEW_GUARD, VIEW_USB, VIEW_LOGS, VIEW_SET };
+static int gView=VIEW_DASH;
+
 static HWND gWnd=nullptr;
 static bool gGuardOn=false;
 static HANDLE gGuardProc=nullptr;
 static bool gScanning=false;
+static bool gScanFull=false;
 static int  gScanPct=0;
 static long gScanCount=0;
+static DWORD gScanStart=0;      // GetTickCount at scan start (for elapsed)
 static std::wstring gScanPath;
+static std::wstring gScanLast;  // last completed-scan summary
 static long gThreats=0;   // real: quarantine item count
 
-static HFONT fDispXL,fDisp,fDispS,fSans,fSansS,fSansXS,fMono,fIcon,fIconBig,fIconNav,fShield;
+static HFONT fDispXL,fDisp,fDispS,fSans,fSansS,fSansXS,fMono;
 
 // ------------------------------------------------------------- helpers --------
 static std::wstring exeDir(){ wchar_t b[MAX_PATH*2]; GetModuleFileNameW(nullptr,b,MAX_PATH*2);
@@ -112,18 +139,27 @@ static HANDLE launchEngine(const std::wstring& cmdline,bool scan,bool* doneFlag)
     if(!ok){ CloseHandle(rd); return nullptr; }
     CloseHandle(pi.hThread);
     if(!doneFlag){ std::thread([rd,scan]{ runReader(rd,scan); }).detach(); return pi.hProcess; }
-    std::thread([rd,scan,hp=pi.hProcess]{
+    long before=gThreats;
+    std::thread([rd,scan,before,hp=pi.hProcess]{
         runReader(rd,scan); WaitForSingleObject(hp,INFINITE); CloseHandle(hp);
-        gScanning=false; gScanPct=100;
-        feedAdd(EV_INFO,L"Scan completed",L"Objects checked \u00b7 review any findings above");
-        gScanPct=0; gScanCount=0;
+        gThreats=quarantineCount(); long found=gThreats-before; if(found<0) found=0;
+        if(scan){
+            gScanning=false; gScanPct=100;
+            DWORD ms=GetTickCount()-gScanStart; wchar_t s[192];
+            if(found>0) wsprintfW(s,L"%ld found \u00b7 quarantined \u00b7 %lu.%lus",found,(unsigned long)(ms/1000),(unsigned long)((ms%1000)/100));
+            else        wsprintfW(s,L"No threats found \u00b7 %lu.%lus",(unsigned long)(ms/1000),(unsigned long)((ms%1000)/100));
+            gScanLast=s;
+            feedAdd(found>0?EV_WARN:EV_OK, gScanFull?L"Full scan completed":L"Quick scan completed", gScanLast);
+        } else {
+            feedAdd(found>0?EV_WARN:EV_OK,L"Task finished", found>0?L"Threats moved to quarantine":L"Completed \u00b7 nothing to clean");
+        }
         if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
     }).detach();
     return nullptr;
 }
 
 static void startScan(bool full){
-    if(gScanning) return; gScanning=true; gScanPct=2; gScanCount=0;
+    if(gScanning) return; gScanning=true; gScanFull=full; gScanPct=2; gScanCount=0; gScanStart=GetTickCount();
     gScanPath = full?L"scanning all fixed drives":L"Downloads, Desktop, Temp, startup";
     feedAdd(EV_INFO, full?L"Full scan started":L"Quick scan started", gScanPath);
     launchEngine(tool(L"scanner.exe")+(full?L" --full":L""),true,(bool*)1);
@@ -138,14 +174,23 @@ static void setGuard(bool on){
 }
 static void doAction(int a){
     switch(a){
-    case A_QUICK: case A_NAV_SCAN: startScan(false); break;
-    case A_FULL: startScan(true); break;
-    case A_GUARD_TGL: case A_NAV_GUARD: setGuard(!gGuardOn); break;
+    // ---- navigation: switch the visible page ----
+    case A_NAV_DASH: gView=VIEW_DASH; break;
+    case A_NAV_SCAN: gView=VIEW_SCAN; break;
+    case A_NAV_QUAR: gView=VIEW_QUAR; gThreats=quarantineCount(); break;
+    case A_NAV_GUARD: gView=VIEW_GUARD; break;
+    case A_NAV_USB:  gView=VIEW_USB; break;
+    case A_NAV_LOGS: gView=VIEW_LOGS; break;
+    case A_NAV_SET:  gView=VIEW_SET; break;
+    // ---- actions ----
+    case A_QUICK: gView=VIEW_SCAN; startScan(false); break;
+    case A_FULL:  gView=VIEW_SCAN; startScan(true); break;
+    case A_GUARD_TGL: setGuard(!gGuardOn); break;
     case A_UNLOCK: feedAdd(EV_INFO,L"Unlock / clean started",L"Undoing lockdown levers + screen effects");
         launchEngine(tool(L"lockdown_breaker.exe")+L" --fix --kill-overlays --kill-effects",false,(bool*)1); break;
     case A_ASEP: feedAdd(EV_INFO,L"Autostart scan started",L"Checking every ASEP against signatures");
         launchEngine(tool(L"asep_cleaner.exe"),false,(bool*)1); break;
-    case A_USB: case A_NAV_USB:{
+    case A_USB:{
         // Open the emergency kit (kept as PowerShell so it still runs if malware
         // blocks .exe via WDAC/SRP policy). One click, no typing.
         std::wstring kit=exeDir()+L"\\..\\advanced\\offline";
@@ -162,11 +207,12 @@ static void doAction(int a){
         bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE; LPITEMIDLIST pidl=SHBrowseForFolderW(&bi);
         if(pidl){ wchar_t p[MAX_PATH]; if(SHGetPathFromIDListW(pidl,p)){ feedAdd(EV_INFO,L"Backup started",p);
             launchEngine(tool(L"backup.exe")+L" --snapshot \""+p+L"\" --keep 10",false,(bool*)1);} CoTaskMemFree(pidl);} break; }
-    case A_QUAR_OPEN: case A_NAV_QUAR:{ std::wstring q=pdRescue()+L"\\Quarantine";
+    case A_QUAR_OPEN:{ std::wstring q=pdRescue()+L"\\Quarantine";
         CreateDirectoryW(pdRescue().c_str(),nullptr); CreateDirectoryW(q.c_str(),nullptr);
         ShellExecuteW(gWnd,L"explore",q.c_str(),nullptr,nullptr,SW_SHOW); break; }
     default: break;
     }
+    if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
 }
 
 // ------------------------------------------------------------- GDI utils ------
@@ -217,11 +263,31 @@ static void drawIcon(HDC dc,const wchar_t* name,RECT b,COLORREF col){
     SelectObject(dc,op); SelectObject(dc,obr); DeleteObject(pen);
 }
 
+// Hero centerpiece: a gradient-filled shield with a check mark (like the design).
+static void heroShield(HDC dc,RECT b,bool prot){
+    double s=(b.right-b.left)/24.0; if(s<=0) return; int ox=b.left, oy=b.top;
+    auto P=[&](double x,double y){ POINT p={(LONG)(ox+x*s),(LONG)(oy+y*s)}; return p; };
+    POINT poly[6]={P(12,2),P(20,5),P(20,12),P(12,22),P(4,12),P(4,5)};
+    HRGN rgn=CreatePolygonRgn(poly,6,WINDING); SelectClipRgn(dc,rgn);
+    if(prot) vgrad(dc,b,RGB(0x1c,0x3f,0x66),RGB(0x11,0x39,0x37));
+    else     vgrad(dc,b,RGB(0x3c,0x31,0x12),RGB(0x2a,0x22,0x0c));
+    SelectClipRgn(dc,nullptr); DeleteObject(rgn);
+    COLORREF sc=prot?CACC2:CWARN;
+    LOGBRUSH lb{BS_SOLID,sc,0};
+    HPEN pen=ExtCreatePen(PS_GEOMETRIC|PS_SOLID|PS_JOIN_ROUND|PS_ENDCAP_ROUND,(int)(s*1.3),&lb,0,nullptr);
+    HGDIOBJ op=SelectObject(dc,pen), ob=SelectObject(dc,GetStockObject(NULL_BRUSH));
+    Polygon(dc,poly,6);
+    COLORREF ck=prot?CGOOD:CWARN; LOGBRUSH lb2{BS_SOLID,ck,0};
+    HPEN pen2=ExtCreatePen(PS_GEOMETRIC|PS_SOLID|PS_JOIN_ROUND|PS_ENDCAP_ROUND,(int)(s*1.7),&lb2,0,nullptr);
+    SelectObject(dc,pen2); POINT ch[3]={P(8,12),P(11,15.2),P(16.5,8)}; Polyline(dc,ch,3);
+    SelectObject(dc,op); SelectObject(dc,ob); DeleteObject(pen); DeleteObject(pen2);
+}
+
 static void reg(RECT r,int a){ gHits.push_back({r,a}); }
 static bool isHot(int a){ return gHover==a && a!=A_NONE; }
 
 // ------------------------------------------------------------- module cards ---
-struct Mod { const wchar_t* icon,*name,*role,*metric1,*metric2; int chipKind; const wchar_t* chip; int action; };
+struct Mod { const wchar_t* icon,*name,*role,*metric1,*metric2; int chipKind; const wchar_t* chip; int action; const wchar_t* foot,*btn; };
 // chipKind: 0 ok,1 warn,2 crit,3 idle
 static void drawMod(HDC dc,RECT r,const Mod& m,bool dim){
     COLORREF bd = isHot(m.action)?CLINE2:CLINE;
@@ -241,14 +307,20 @@ static void drawMod(HDC dc,RECT r,const Mod& m,bool dim){
     else if(m.chipKind==3){cf=CMUT;cb=RGB(0x14,0x1c,0x2c);cd=CLINE;}
     SIZE sz; HGDIOBJ of=SelectObject(dc,fSansXS); GetTextExtentPoint32W(dc,m.chip,(int)wcslen(m.chip),&sz); SelectObject(dc,of);
     chip(dc,r.right-sz.cx-46,r.top+16,m.chip,cf,cb,cd);
-    // metric box
-    RECT mb={r.left+16,r.top+66,r.right-16,r.top+110}; card(dc,mb,CBG2,CLINE,8);
-    RECT m1={mb.left+11,mb.top+7,mb.right-11,mb.top+27}; txt(dc,m.metric1,m1,fSansS,CMUT,DT_LEFT|DT_SINGLELINE);
-    RECT m2={mb.left+11,mb.top+24,mb.right-11,mb.bottom-6}; txt(dc,m.metric2,m2,fSansS,CMUT,DT_LEFT|DT_SINGLELINE);
-    // action link
-    RECT lk={r.right-92,r.bottom-32,r.right-14,r.bottom-8};
-    txt(dc,isHot(m.action)?L"Open  \u2192":L"Open  \u203a",lk,fSansS,CACC2,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-    reg(r,m.action);
+    // metric box (compact, two lines)
+    RECT mb={r.left+16,r.top+62,r.right-16,r.top+96}; card(dc,mb,CBG2,CLINE,8);
+    RECT m1={mb.left+11,mb.top+4,mb.right-11,mb.top+19}; txt(dc,m.metric1,m1,fSansXS,CMUT,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+    RECT m2={mb.left+11,mb.top+18,mb.right-11,mb.bottom-3}; txt(dc,m.metric2,m2,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+    // footer: short status on the left, a real button on the right
+    RECT fl={r.left+17,r.bottom-30,r.right-16,r.bottom-8}; txt(dc,m.foot,fl,fSansXS,CMUT2,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    SIZE bs; HGDIOBJ ofb=SelectObject(dc,fSansXS); GetTextExtentPoint32W(dc,m.btn,(int)wcslen(m.btn),&bs); SelectObject(dc,ofb);
+    int bw=bs.cx+26; RECT bt={r.right-16-bw,r.bottom-33,r.right-16,r.bottom-9};
+    bool en=m.action!=A_NONE, hot=en&&isHot(m.action);
+    COLORREF bf = !en?RGB(0x14,0x1c,0x2c) : hot?CACC:CACCD;
+    COLORREF bb = !en?CLINE : hot?CACC:RGB(0x22,0x37,0x5c);
+    COLORREF btc= !en?CMUT2 : hot?RGB(0x04,0x12,0x2b):CACC2;
+    card(dc,bt,bf,bb,8); txt(dc,m.btn,bt,fSansXS,btc,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    if(en) reg(bt,m.action);
 }
 
 // ------------------------------------------------------------- paint ----------
@@ -261,6 +333,92 @@ static void navItem(HDC dc,int x,int& y,int w,const wchar_t* icon,const wchar_t*
     if(badge){ SIZE sz; HGDIOBJ of=SelectObject(dc,fSansXS); GetTextExtentPoint32W(dc,badge,(int)wcslen(badge),&sz); SelectObject(dc,of);
         RECT b={x+w-sz.cx-24,y+9,x+w-8,y+29}; card(dc,b,CWARN,CWARN,10); txt(dc,badge,b,fSansXS,RGB(0x18,0x12,0x00),DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
     reg(r,action); y+=40;
+}
+
+// ---- reusable cards (shared by the dashboard and the dedicated pages) --------
+static void drawFeedCard(HDC dc,RECT act){
+    card(dc,act,CPANEL,CLINE,14);
+    RECT ahl={act.left+18,act.top,act.right-16,act.top+44};
+    txt(dc,L"Activity",ahl,fDispS,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    RECT ahln={act.left,act.top+44,act.right,act.top+45}; fillR(dc,ahln,CLINE);
+    int ey=act.top+52;
+    for(auto& e:gFeed){ if(ey>act.bottom-40) break;
+        COLORREF sv= e.sev==EV_OK?CGOOD:e.sev==EV_WARN?CWARN:e.sev==EV_CRIT?CCRIT:CACC;
+        RECT bar={act.left+18,ey+2,act.left+21,ey+40}; card(dc,bar,sv,sv,2);
+        RECT t={act.left+32,ey,act.right-70,ey+20}; txt(dc,e.title.c_str(),t,fSansS,CINK,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+        RECT d={act.left+32,ey+20,act.right-70,ey+40}; txt(dc,e.detail.c_str(),d,fSansXS,CMUT,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+        RECT g={act.right-64,ey,act.right-14,ey+20}; txt(dc,e.ago.c_str(),g,fSansXS,CMUT2,DT_RIGHT|DT_SINGLELINE);
+        ey+=46; }
+    if(gFeed.empty()){ RECT em={act.left,act.top+60,act.right,act.bottom}; txt(dc,L"No activity yet. Run a scan or turn on protection.",em,fSansS,CMUT2,DT_CENTER|DT_TOP); }
+}
+static void drawQuarCard(HDC dc,RECT quar){
+    card(dc,quar,CPANEL,CLINE,14);
+    RECT qhl={quar.left+18,quar.top,quar.right-16,quar.top+44}; txt(dc,L"Quarantine",qhl,fDispS,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    { wchar_t qc[24]; wsprintfW(qc,L"%ld item%ls",gThreats,gThreats==1?L"":L"s"); RECT qcr={quar.left,quar.top,quar.right-16,quar.top+44};
+      txt(dc,gThreats?qc:L"empty",qcr,fMono,CMUT2,DT_RIGHT|DT_VCENTER|DT_SINGLELINE); }
+    RECT qln={quar.left,quar.top+44,quar.right,quar.top+45}; fillR(dc,qln,CLINE);
+    RECT qbody={quar.left,quar.top+52,quar.right,quar.bottom};
+    if(gThreats==0){ txt(dc,L"Quarantine is empty.\nNeutralized threats will appear here.",qbody,fSansS,CMUT2,DT_CENTER|DT_TOP);
+        RECT ob={quar.left+18,quar.bottom-46,quar.right-18,quar.bottom-14};
+        card(dc,ob, isHot(A_QUAR_OPEN)?CPANEL2:CBG2, isHot(A_QUAR_OPEN)?CACC:CLINE2,9);
+        txt(dc,L"Open quarantine folder",ob,fSansS,CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE); reg(ob,A_QUAR_OPEN); }
+    else { RECT ob={quar.left+18,quar.top+56,quar.right-18,quar.top+88};
+        card(dc,ob, isHot(A_QUAR_OPEN)?CPANEL2:CBG2, isHot(A_QUAR_OPEN)?CACC:CLINE2,9);
+        wchar_t s[48]; wsprintfW(s,L"Review %ld quarantined item%ls",gThreats,gThreats==1?L"":L"s");
+        txt(dc,s,ob,fSansS,CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE); reg(ob,A_QUAR_OPEN); }
+}
+static void pageBtn(HDC dc,RECT r,const wchar_t* label,int action,bool primary){
+    bool hot=isHot(action);
+    COLORREF f = primary?(hot?CACC2:CACC):CPANEL2;
+    COLORREF b = primary?(hot?CACC2:CACC):(hot?CACC:CLINE2);
+    card(dc,r,f,b,10); txt(dc,label,r,fSansS,primary?RGB(0x04,0x12,0x2b):CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    reg(r,action);
+}
+// ---- dedicated pages ---------------------------------------------------------
+static void drawScanPage(HDC dc,int cx,int cy,int cw,RECT cr){
+    int pad=24; RECT c={cx,cy,cx+cw,cy+232}; card(dc,c,CPANEL,CLINE,14);
+    RECT ic={c.left+22,c.top+22,c.left+62,c.top+62}; card(dc,ic,CACCD,RGB(0x22,0x37,0x5c),10);
+    { RECT ii={ic.left+9,ic.top+9,ic.right-9,ic.bottom-9}; drawIcon(dc,L"search",ii,CACC2); }
+    RECT ti={c.left+74,c.top+18,c.right-24,c.top+48};
+    txt(dc, gScanning?(gScanFull?L"Full scan running":L"Quick scan running"):L"Threat scanner", ti,fDisp,CINK,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    RECT su={c.left+74,c.top+50,c.right-24,c.top+72};
+    txt(dc, gScanning?L"Signatures + PE heuristics · downloads deep-scanned first":
+            (gScanLast.empty()?L"Quick scans high-risk folders. Full scan covers every fixed drive.":gScanLast.c_str()),
+        su,fSansS,CMUT,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+    int pct = gScanning?gScanPct:(gScanLast.empty()?0:100);
+    RECT pr={c.left+24,c.top+94,c.right-24,c.top+110}; card(dc,pr,CPANEL2,CLINE,8);
+    if(pct>0){ RECT fl={pr.left+2,pr.top+2,pr.left+2+(int)((pr.right-pr.left-4)*pct/100.0),pr.bottom-2};
+        if(fl.right>fl.left+3){ COLORREF pc=gScanning?CACC:CGOOD; card(dc,fl,pc,pc,7);} }
+    RECT pl={c.left+24,c.top+120,c.right-24,c.top+142}; wchar_t s[240];
+    if(gScanning) wsprintfW(s,L"%d%%   ·   %ls   ·   %ld items",pct,gScanPath.c_str(),gScanCount);
+    else if(!gScanLast.empty()) wsprintfW(s,L"Done   ·   %ls",gScanLast.c_str());
+    else wcscpy(s,L"Idle · ready to scan");
+    txt(dc,s,pl,fMono,gScanning?CACC2:CMUT,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+    int by=c.top+164;
+    if(!gScanning){
+        RECT b1={c.left+24,by,c.left+190,by+40}; pageBtn(dc,b1,L"Run quick scan",A_QUICK,true);
+        RECT b2={c.left+202,by,c.left+326,by+40}; pageBtn(dc,b2,L"Full scan",A_FULL,false);
+    } else { RECT b1={c.left+24,by,c.left+190,by+40}; card(dc,b1,CPANEL2,CLINE,10);
+        txt(dc,L"Scanning…",b1,fSansS,CMUT,DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
+    RECT act={cx,c.bottom+pad,cx+cw,cr.bottom-pad}; if(act.bottom-act.top>120) drawFeedCard(dc,act);
+}
+static void drawGuardPage(HDC dc,int cx,int cy,int cw,RECT cr){
+    int pad=24; RECT c={cx,cy,cx+cw,cy+224}; card(dc,c,CPANEL,CLINE,14);
+    RECT si={c.left+30,c.top+34,c.left+158,c.top+162}; heroShield(dc,si,gGuardOn);
+    int hx=c.left+190;
+    RECT he={hx,c.top+34,c.right-24,c.top+54}; txt(dc,gGuardOn?L"REAL-TIME GUARD ACTIVE":L"REAL-TIME GUARD OFF",he,fSansXS,gGuardOn?CGOOD:CWARN,DT_LEFT|DT_SINGLELINE);
+    RECT ht={hx,c.top+52,c.right-24,c.top+92}; txt(dc,gGuardOn?L"Your files are protected":L"Files are not protected",ht,fDispXL,CINK,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    RECT hs={hx,c.top+96,c.right-24,c.top+156}; txt(dc,L"Behavioral detection arms canary files and, on a ransomware write pattern, suspends the busiest writing process tree. The disk shield denies raw writes to physical drives to stop wipers and MBR/GPT overwrite.",hs,fSansS,CMUT,DT_LEFT|DT_WORDBREAK);
+    RECT bt={hx,c.top+164,hx+186,c.top+204}; pageBtn(dc,bt,gGuardOn?L"Turn off guard":L"Turn on guard",A_GUARD_TGL,!gGuardOn);
+    RECT act={cx,c.bottom+pad,cx+cw,cr.bottom-pad}; if(act.bottom-act.top>120) drawFeedCard(dc,act);
+}
+static void drawSimplePage(HDC dc,int cx,int cy,int cw,RECT cr,const wchar_t* icon,const wchar_t* title,const wchar_t* desc,const wchar_t* btn,int action){
+    RECT c={cx,cy,cx+cw,cy+204}; card(dc,c,CPANEL,CLINE,14);
+    RECT ic={c.left+22,c.top+22,c.left+62,c.top+62}; card(dc,ic,CACCD,RGB(0x22,0x37,0x5c),10);
+    { RECT ii={ic.left+9,ic.top+9,ic.right-9,ic.bottom-9}; drawIcon(dc,icon,ii,CACC2); }
+    RECT ti={c.left+74,c.top+22,c.right-24,c.top+52}; txt(dc,title,ti,fDisp,CINK,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    RECT ds={c.left+24,c.top+82,c.right-24,c.top+150}; txt(dc,desc,ds,fSansS,CMUT,DT_LEFT|DT_WORDBREAK);
+    if(btn){ RECT bt={c.left+24,c.top+152,c.left+250,c.top+192}; pageBtn(dc,bt,btn,action,true); }
 }
 
 static void paint(HWND hwnd){
@@ -279,13 +437,13 @@ static void paint(HWND hwnd){
     RECT bn={62,20,RAIL-8,44}; txt(dc,L"Rescue",bn,fDisp,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     RECT bs={64,44,RAIL-8,62}; txt(dc,L"SECURITY CENTER",bs,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
     int ny=84;
-    navItem(dc,14,ny,RAIL-28,L"home",L"Dashboard",A_NAV_DASH,true,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"shield",L"Real-time Guard",A_NAV_GUARD,false,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"search",L"Scan",A_NAV_SCAN,false,nullptr);
-    { wchar_t qc[8]; wsprintfW(qc,L"%ld",gThreats); navItem(dc,14,ny,RAIL-28,L"warn",L"Quarantine",A_NAV_QUAR,false, gThreats>0?qc:nullptr); }
-    navItem(dc,14,ny,RAIL-28,L"usb",L"Rescue USB",A_NAV_USB,false,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"page",L"Logs",A_NAV_LOGS,false,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"gear",L"Settings",A_NAV_SET,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"home",L"Dashboard",A_NAV_DASH,gView==VIEW_DASH,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"shield",L"Real-time Guard",A_NAV_GUARD,gView==VIEW_GUARD,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"search",L"Scan",A_NAV_SCAN,gView==VIEW_SCAN,nullptr);
+    { wchar_t qc[8]; wsprintfW(qc,L"%ld",gThreats); navItem(dc,14,ny,RAIL-28,L"warn",L"Quarantine",A_NAV_QUAR,gView==VIEW_QUAR, gThreats>0?qc:nullptr); }
+    navItem(dc,14,ny,RAIL-28,L"usb",L"Rescue USB",A_NAV_USB,gView==VIEW_USB,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"page",L"Logs",A_NAV_LOGS,gView==VIEW_LOGS,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"gear",L"Settings",A_NAV_SET,gView==VIEW_SET,nullptr);
     RECT foot={22,cr.bottom-56,RAIL-14,cr.bottom-12};
     txt(dc,gGuardOn?L"\u25CF  Protected \u00b7 guard live\nRescue 0.1.0 \u00b7 both arches":
                     L"\u25CF  Idle \u00b7 guard off\nRescue 0.1.0 \u00b7 both arches",
@@ -295,13 +453,31 @@ static void paint(HWND hwnd){
     int X=RAIL, W=cr.right-RAIL;
     RECT top={X,0,cr.right,58}; fillR(dc,top,CBG2);
     RECT tl={X,57,cr.right,58}; fillR(dc,tl,CLINE);
-    RECT th={X+26,0,X+300,58}; txt(dc,L"Dashboard",th,fDispS,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    const wchar_t* vt[]={L"Dashboard",L"Scan",L"Quarantine",L"Real-time Guard",L"Rescue USB",L"Activity Log",L"Settings"};
+    RECT th={X+26,0,X+360,58}; txt(dc,vt[gView],th,fDispS,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     wchar_t clock[32]; SYSTEMTIME st; GetLocalTime(&st); wsprintfW(clock,L"%02d:%02d:%02d",st.wHour,st.wMinute,st.wSecond);
     RECT tc={cr.right-140,0,cr.right-58,58}; txt(dc,clock,tc,fMono,CMUT,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
     RECT tg={cr.right-46,14,cr.right-14,46}; card(dc,tg,CPANEL,CLINE,9);
     { RECT gi={tg.left+7,tg.top+7,tg.right-7,tg.bottom-7}; drawIcon(dc,L"gear",gi,CMUT); } reg(tg,A_NAV_SET);
 
     int pad=24, cx=X+pad, cw=W-pad*2, y=58+pad;
+
+    // ================= page dispatch =================
+    if(gView==VIEW_SCAN){ drawScanPage(dc,cx,y,cw,cr); }
+    else if(gView==VIEW_QUAR){ RECT c={cx,y,cx+cw,cr.bottom-pad}; drawQuarCard(dc,c); }
+    else if(gView==VIEW_GUARD){ drawGuardPage(dc,cx,y,cw,cr); }
+    else if(gView==VIEW_USB){ drawSimplePage(dc,cx,y,cw,cr,L"usb",L"Rescue USB",
+        L"Build a bootable rescue USB to clean or restore a machine that no longer boots. "
+        L"WinPE boot media, or a one-click restore disk from an official Windows ISO plus your backup. "
+        L"The kit stays as PowerShell on purpose: if malware blocks .exe files via system policy, the .ps1 kit still runs.",
+        L"Open emergency kit",A_USB); }
+    else if(gView==VIEW_LOGS){ RECT act={cx,y,cx+cw,cr.bottom-pad}; drawFeedCard(dc,act); }
+    else if(gView==VIEW_SET){ drawSimplePage(dc,cx,y,cw,cr,L"gear",L"Settings",
+        L"Rescue runs elevated so it can touch OS-protected files and HKLM policy keys. "
+        L"Real-time guard, disk shield and canary files are controlled from the Dashboard and the Real-time Guard page. "
+        L"Engine 0.1.0 · x86_64 + ARM64 builds · bundled Sora / IBM Plex UI fonts.",
+        nullptr,A_NONE); }
+    else { // ================= VIEW_DASH =================
 
     // ---------------- hero ----------------
     int heroH=196; RECT hero={cx,y,cx+cw,y+heroH}; vgrad(dc,hero,CPANEL,CBG2);
@@ -312,7 +488,7 @@ static void paint(HWND hwnd){
       RoundRect(dc,hero.left,hero.top,hero.right,hero.bottom,14,14); SelectObject(dc,op); SelectObject(dc,obr); DeleteObject(p); }
     // shield
     RECT sh={hero.left+28,hero.top+28,hero.left+156,hero.bottom-28};
-    { int d=(sh.bottom-sh.top); RECT si={(sh.left+sh.right-d)/2,sh.top,(sh.left+sh.right-d)/2+d,sh.bottom}; drawIcon(dc,L"shield",si,gGuardOn?CGOOD:CWARN); }
+    { int d=(sh.bottom-sh.top); RECT si={(sh.left+sh.right-d)/2,sh.top,(sh.left+sh.right-d)/2+d,sh.bottom}; heroShield(dc,si,gGuardOn); }
     int hx=hero.left+180;
     RECT he={hx,hero.top+22,hero.right-24,hero.top+42};
     txt(dc,gGuardOn?L"SYSTEM PROTECTED":L"REDUCED PROTECTION",he,fSansXS,gGuardOn?CGOOD:CWARN,DT_LEFT|DT_SINGLELINE);
@@ -352,18 +528,18 @@ static void paint(HWND hwnd){
     y=hero.bottom+pad;
 
     // ---------------- section header ----------------
-    RECT sec={cx,y,cx+240,y+20}; txt(dc,L"Defense modules",sec,fSans,CINK,DT_LEFT|DT_SINGLELINE);
+    RECT sec={cx,y,cx+240,y+20}; txt(dc,L"Defense modules",sec,fDispS,CINK,DT_LEFT|DT_SINGLELINE);
     RECT secl={cx+150,y+10,cx+cw,y+11}; fillR(dc,secl,CLINE);
     y+=30;
 
     // ---------------- module grid (3 cols x 2 rows) ----------------
     Mod mods[6]={
-        {L"shield",L"Ransom Guard",L"Behavioral real-time protection", gGuardOn?L"Watching folders \u00b7 6 canaries armed":L"Off \u00b7 turn on to arm canaries", L"Trip \u2192 suspend the busiest writer", 0, gGuardOn?L"Active":L"Off", A_GUARD_TGL},
-        {L"unlock",L"Lockdown Breaker",L"Undo malware lockdowns", L"Task Mgr \u00b7 regedit \u00b7 CMD \u00b7 shell", L"WDAC policy \u00b7 input lock \u00b7 overlays", 0, L"Ready", A_UNLOCK},
-        {L"list",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP},
-        {L"search",L"Threat Scanner",L"Heuristic + hash + quarantine", L"PE entropy \u00b7 MOTW priority", L"Downloads deep-scanned first", 0, L"Updated", A_QUICK},
-        {L"dog",L"Watchdog",L"Self-protecting service pair", L"Two services \u00b7 each restarts the other", L"Keeps Ransom Guard alive", 0, L"Ready", A_BACKUP},
-        {L"cpu",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Requires a signed driver to load", 3, L"Not installed", A_NONE},
+        {L"shield",L"Ransom Guard",L"Behavioral real-time protection", gGuardOn?L"Watching folders \u00b7 6 canaries armed":L"Off \u00b7 turn on to arm canaries", L"Trip \u2192 suspend the busiest writer", 0, gGuardOn?L"Active":L"Off", A_GUARD_TGL, gGuardOn?L"Live":L"Off", gGuardOn?L"Turn off":L"Turn on"},
+        {L"unlock",L"Lockdown Breaker",L"Undo malware lockdowns", L"Task Mgr \u00b7 regedit \u00b7 CMD \u00b7 shell", L"WDAC policy \u00b7 input lock \u00b7 overlays", 0, L"Ready", A_UNLOCK, L"Idle", L"Scan now"},
+        {L"list",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP, L"Ready", L"Review"},
+        {L"search",L"Threat Scanner",L"Heuristic + hash + quarantine", L"PE entropy \u00b7 MOTW priority", L"Downloads deep-scanned first", 0, L"Updated", A_QUICK, L"Ready", L"Scan"},
+        {L"dog",L"Watchdog",L"Self-protecting service pair", L"Two services \u00b7 each restarts the other", L"Keeps Ransom Guard alive", 0, L"Ready", A_BACKUP, L"Paired", L"Back up"},
+        {L"cpu",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Requires a signed driver to load", 3, L"Not installed", A_NONE, L"Phase 6", L"Learn why"},
     };
     mods[2].chipKind=0; // asep neutral unless flagged
     int cols=3, gap=14; int mw=(cw-gap*(cols-1))/cols, mh=124;
@@ -374,34 +550,10 @@ static void paint(HWND hwnd){
     // ---------------- lower: activity + quarantine ----------------
     int lgap=22; int aw=(cw-lgap)*58/100;
     int lh=cr.bottom-y-pad; if(lh<140) lh=140;
-    RECT act={cx,y,cx+aw,y+lh}; card(dc,act,CPANEL,CLINE,14);
-    RECT ahl={act.left+18,act.top,act.right-16,act.top+44};
-    txt(dc,L"Activity",ahl,fSans,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    RECT ahln={act.left,act.top+44,act.right,act.top+45}; fillR(dc,ahln,CLINE);
-    int ey=act.top+52;
-    for(auto& e:gFeed){ if(ey>act.bottom-40) break;
-        COLORREF sv= e.sev==EV_OK?CGOOD:e.sev==EV_WARN?CWARN:e.sev==EV_CRIT?CCRIT:CACC;
-        RECT bar={act.left+18,ey+2,act.left+21,ey+40}; card(dc,bar,sv,sv,2);
-        RECT t={act.left+32,ey,act.right-70,ey+20}; txt(dc,e.title.c_str(),t,fSansS,CINK,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
-        RECT d={act.left+32,ey+20,act.right-70,ey+40}; txt(dc,e.detail.c_str(),d,fSansXS,CMUT,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
-        RECT g={act.right-64,ey,act.right-14,ey+20}; txt(dc,e.ago.c_str(),g,fSansXS,CMUT2,DT_RIGHT|DT_SINGLELINE);
-        ey+=46; }
-    if(gFeed.empty()){ RECT em={act.left,act.top+60,act.right,act.bottom}; txt(dc,L"No activity yet. Run a scan or turn on protection.",em,fSansS,CMUT2,DT_CENTER|DT_TOP); }
+    RECT act={cx,y,cx+aw,y+lh}; drawFeedCard(dc,act);
+    RECT quar={cx+aw+lgap,y,cx+cw,y+lh}; drawQuarCard(dc,quar);
 
-    RECT quar={cx+aw+lgap,y,cx+cw,y+lh}; card(dc,quar,CPANEL,CLINE,14);
-    RECT qhl={quar.left+18,quar.top,quar.right-16,quar.top+44}; txt(dc,L"Quarantine",qhl,fSans,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    { wchar_t qc[24]; wsprintfW(qc,L"%ld item%ls",gThreats,gThreats==1?L"":L"s"); RECT qcr={quar.left,quar.top,quar.right-16,quar.top+44};
-      txt(dc,gThreats?qc:L"empty",qcr,fMono,CMUT2,DT_RIGHT|DT_VCENTER|DT_SINGLELINE); }
-    RECT qln={quar.left,quar.top+44,quar.right,quar.top+45}; fillR(dc,qln,CLINE);
-    RECT qbody={quar.left,quar.top+52,quar.right,quar.bottom};
-    if(gThreats==0){ txt(dc,L"Quarantine is empty.\nNeutralized threats will appear here.",qbody,fSansS,CMUT2,DT_CENTER|DT_TOP);
-        RECT ob={quar.left+18,quar.bottom-46,quar.right-18,quar.bottom-14};
-        card(dc,ob, isHot(A_QUAR_OPEN)?CPANEL2:CBG2, isHot(A_QUAR_OPEN)?CACC:CLINE2,9);
-        txt(dc,L"Open quarantine folder",ob,fSansS,CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE); reg(ob,A_QUAR_OPEN); }
-    else { RECT ob={quar.left+18,quar.top+56,quar.right-18,quar.top+88};
-        card(dc,ob, isHot(A_QUAR_OPEN)?CPANEL2:CBG2, isHot(A_QUAR_OPEN)?CACC:CLINE2,9);
-        wchar_t s[48]; wsprintfW(s,L"Review %ld quarantined item%ls",gThreats,gThreats==1?L"":L"s");
-        txt(dc,s,ob,fSansS,CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE); reg(ob,A_QUAR_OPEN); }
+    } // ================= end VIEW_DASH =================
 
     BitBlt(wdc,0,0,cr.right,cr.bottom,dc,0,0,SRCCOPY);
     SelectObject(dc,ob); DeleteObject(bmp); DeleteDC(dc); EndPaint(hwnd,&ps);
@@ -417,10 +569,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_CREATE:{
         auto F=[&](int h,int wt,const wchar_t* fam){ return CreateFontW(h,0,0,0,wt,0,0,0,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,fam); };
-        fDispXL=F(30,FW_BOLD,L"Segoe UI"); fDisp=F(22,FW_SEMIBOLD,L"Segoe UI"); fDispS=F(18,FW_SEMIBOLD,L"Segoe UI");
-        fSans=F(16,FW_NORMAL,L"Segoe UI"); fSansS=F(15,FW_NORMAL,L"Segoe UI"); fSansXS=F(12,FW_SEMIBOLD,L"Segoe UI");
-        fMono=F(14,FW_NORMAL,L"Consolas"); fIcon=F(22,FW_NORMAL,L"Segoe MDL2 Assets"); fIconBig=F(30,FW_NORMAL,L"Segoe MDL2 Assets");
-        fIconNav=F(17,FW_NORMAL,L"Segoe MDL2 Assets"); fShield=F(84,FW_NORMAL,L"Segoe MDL2 Assets");
+        // Bundled type: Sora (display) + IBM Plex Sans/Mono (body). Loaded from
+        // the exe's own resources in wWinMain, so these faces resolve everywhere.
+        fDispXL=F(30,FW_NORMAL,L"Sora ExtraBold"); fDisp=F(22,FW_NORMAL,L"Sora ExtraBold"); fDispS=F(18,FW_NORMAL,L"Sora SemiBold");
+        fSans=F(16,FW_NORMAL,L"IBM Plex Sans"); fSansS=F(15,FW_NORMAL,L"IBM Plex Sans"); fSansXS=F(12,FW_NORMAL,L"IBM Plex Sans SemiBold");
+        fMono=F(14,FW_NORMAL,L"IBM Plex Mono");
         gThreats=quarantineCount();
         feedAdd(EV_INFO,L"Welcome to Rescue",L"Run a quick scan, or turn on real-time protection.");
         SetTimer(hwnd,1,1000,nullptr); return 0; }
@@ -442,6 +595,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,PWSTR,int nShow){
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX icc{sizeof(icc),ICC_STANDARD_CLASSES}; InitCommonControlsEx(&icc);
+    loadBundledFonts(hInst);   // register Sora + IBM Plex before any font is made
+    // Optional deep-link: open straight to a page, e.g. Rescue.exe --view=scan
+    { std::wstring cl=GetCommandLineW();
+      if(cl.find(L"--view=scan")!=std::wstring::npos) gView=VIEW_SCAN;
+      else if(cl.find(L"--view=quar")!=std::wstring::npos) gView=VIEW_QUAR;
+      else if(cl.find(L"--view=guard")!=std::wstring::npos) gView=VIEW_GUARD;
+      else if(cl.find(L"--view=usb")!=std::wstring::npos) gView=VIEW_USB;
+      else if(cl.find(L"--view=logs")!=std::wstring::npos) gView=VIEW_LOGS;
+      else if(cl.find(L"--view=settings")!=std::wstring::npos) gView=VIEW_SET;
+      if(cl.find(L"--demo")!=std::wstring::npos){ // render-preview only (screenshots)
+          gScanning=true; gScanFull=false; gScanPct=63; gScanCount=18452; gScanPath=L"C:\\Users\\me\\Downloads"; }
+    }
     WNDCLASSW wc{}; wc.lpfnWndProc=WndProc; wc.hInstance=hInst; wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     wc.hbrBackground=nullptr; wc.lpszClassName=L"RescueSecurityCenter"; wc.hIcon=LoadIconW(nullptr,IDI_SHIELD);
     RegisterClassW(&wc);

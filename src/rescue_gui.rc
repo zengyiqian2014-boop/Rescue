@@ -3,6 +3,22 @@
 // UAC manifest (requireAdministrator) - shared with the other Rescue tools.
 1 24 "rescue.manifest"
 
+// Bundled UI fonts (OFL, redistributable). Embedded as RCDATA and loaded
+// privately at startup with AddFontMemResourceEx, so the app renders exactly
+// like the design on any machine - no font install, no dependency on Segoe UI.
+//   Sora        -> display headings   (SIL OFL 1.1)
+//   IBM Plex    -> body + monospace    (SIL OFL 1.1)
+#define IDF_SORA_SB   101
+#define IDF_SORA_XB   102
+#define IDF_PLEX_RG   103
+#define IDF_PLEX_SB   104
+#define IDF_PLEXMONO  105
+IDF_SORA_SB   RCDATA "fonts/Sora-SemiBold.ttf"
+IDF_SORA_XB   RCDATA "fonts/Sora-ExtraBold.ttf"
+IDF_PLEX_RG   RCDATA "fonts/IBMPlexSans-Regular.ttf"
+IDF_PLEX_SB   RCDATA "fonts/IBMPlexSans-SemiBold.ttf"
+IDF_PLEXMONO  RCDATA "fonts/IBMPlexMono-Regular.ttf"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 0,1,0,0
  PRODUCTVERSION 0,1,0,0
