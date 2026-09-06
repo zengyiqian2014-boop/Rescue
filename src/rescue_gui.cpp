@@ -190,6 +190,33 @@ static void chip(HDC dc,int x,int y,const wchar_t* s,COLORREF fg,COLORREF bg,COL
     HBRUSH b=CreateSolidBrush(fg); RECT d={x+10,y+8,x+16,y+14}; HGDIOBJ ob=SelectObject(dc,b);
     Ellipse(dc,d.left,d.top,d.right,d.bottom); SelectObject(dc,ob); DeleteObject(b);
     RECT tr={x+20,y,r.right,y+22}; txt(dc,s,tr,fSansXS,fg,DT_LEFT|DT_VCENTER|DT_SINGLELINE); }
+// crisp vector icons drawn with GDI - identical on every Windows, no icon font.
+static void drawIcon(HDC dc,const wchar_t* name,RECT b,COLORREF col){
+    double s=(b.right-b.left)/24.0; if(s<=0) return; int ox=b.left, oy=b.top;
+    int w=(int)(s*1.7); if(w<2) w=2;
+    LOGBRUSH lb{BS_SOLID,col,0};
+    HPEN pen=ExtCreatePen(PS_GEOMETRIC|PS_SOLID|PS_ENDCAP_ROUND|PS_JOIN_ROUND,w,&lb,0,nullptr);
+    HGDIOBJ op=SelectObject(dc,pen), obr=SelectObject(dc,GetStockObject(NULL_BRUSH));
+    auto P=[&](double x,double y){ POINT pt={(LONG)(ox+x*s),(LONG)(oy+y*s)}; return pt; };
+    auto L=[&](double x1,double y1,double x2,double y2){ POINT a=P(x1,y1),c=P(x2,y2); MoveToEx(dc,a.x,a.y,0); LineTo(dc,c.x,c.y); };
+    auto PL=[&](std::initializer_list<POINT> v){ std::vector<POINT> q(v); Polyline(dc,q.data(),(int)q.size()); };
+    auto EL=[&](double x1,double y1,double x2,double y2){ POINT a=P(x1,y1),c=P(x2,y2); Ellipse(dc,a.x,a.y,c.x,c.y); };
+    std::wstring n=name;
+    if(n==L"shield"){ PL({P(12,2),P(20,5),P(20,12),P(12,22),P(4,12),P(4,5),P(12,2)}); PL({P(8,12),P(11,15),P(16,8.5)}); }
+    else if(n==L"home"){ PL({P(4,11),P(12,4),P(20,11)}); PL({P(7,11),P(7,20),P(17,20),P(17,11)}); }
+    else if(n==L"search"){ EL(4,4,16,16); L(14.5,14.5,20,20); }
+    else if(n==L"warn"){ PL({P(12,3),P(21,20),P(3,20),P(12,3)}); L(12,9,12,15); L(12,17.6,12,18.2); }
+    else if(n==L"usb"){ PL({P(8,6),P(8,20),P(16,20),P(16,6),P(8,6)}); L(9.5,3,9.5,6); L(14.5,3,14.5,6); L(8,10,16,10); }
+    else if(n==L"page"){ PL({P(6,3),P(6,21),P(18,21),P(18,3),P(6,3)}); L(9,8,15,8); L(9,12,15,12); L(9,16,15,16); }
+    else if(n==L"gear"){ EL(7.5,7.5,16.5,16.5); L(12,3,12,6); L(12,18,12,21); L(3,12,6,12); L(18,12,21,12); L(5.5,5.5,7.6,7.6); L(16.4,16.4,18.5,18.5); L(16.4,7.6,18.5,5.5); L(7.6,16.4,5.5,18.5); }
+    else if(n==L"unlock"){ PL({P(6,11),P(6,20),P(18,20),P(18,11),P(6,11)}); PL({P(9,11),P(9,7),P(10.5,5),P(13.5,5),P(15,7)}); }
+    else if(n==L"list"){ L(5,7,19,7); L(5,12,19,12); L(5,17,15,17); }
+    else if(n==L"dog"){ EL(4,7.5,20,16.5); EL(10,11,14,15); }
+    else if(n==L"cpu"){ PL({P(7,7),P(7,17),P(17,17),P(17,7),P(7,7)}); PL({P(10,10),P(10,14),P(14,14),P(14,10),P(10,10)});
+        L(9,4,9,7); L(15,4,15,7); L(9,17,9,20); L(15,17,15,20); L(4,9,7,9); L(4,15,7,15); L(17,9,20,9); L(17,15,20,15); }
+    SelectObject(dc,op); SelectObject(dc,obr); DeleteObject(pen);
+}
+
 static void reg(RECT r,int a){ gHits.push_back({r,a}); }
 static bool isHot(int a){ return gHover==a && a!=A_NONE; }
 
@@ -204,7 +231,7 @@ static void drawMod(HDC dc,RECT r,const Mod& m,bool dim){
     COLORREF itbg=dim?RGB(0x14,0x1c,0x2c):(m.chipKind==1?CWARND:CACCD);
     COLORREF itfg=dim?CMUT:(m.chipKind==1?CWARN:CACC2);
     card(dc,it,itbg,dim?CLINE:RGB(0x22,0x37,0x5c),10);
-    txt(dc,m.icon,it,fIcon,itfg,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    { RECT ii={it.left+9,it.top+9,it.right-9,it.bottom-9}; drawIcon(dc,m.icon,ii,itfg); }
     RECT nm={r.left+64,r.top+16,r.right-96,r.top+40}; txt(dc,m.name,nm,fDispS,CINK,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
     RECT ro={r.left+64,r.top+38,r.right-16,r.top+58}; txt(dc,m.role,ro,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
     // chip top-right
@@ -229,7 +256,7 @@ static void navItem(HDC dc,int x,int& y,int w,const wchar_t* icon,const wchar_t*
     RECT r={x,y,x+w,y+38};
     if(on) card(dc,r,CACCD,CACCD,9);
     else if(isHot(action)){ card(dc,r,CPANEL,CPANEL,9); }
-    RECT ic={x+11,y,x+34,y+38}; txt(dc,icon,ic,fIconNav,on?CACC2:CMUT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    { RECT ic={x+9,y+9,x+29,y+29}; drawIcon(dc,icon,ic,on?CACC2:CMUT); }
     RECT tr={x+40,y,x+w-30,y+38}; txt(dc,label,tr,fSans,on?CACC2:CMUT,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     if(badge){ SIZE sz; HGDIOBJ of=SelectObject(dc,fSansXS); GetTextExtentPoint32W(dc,badge,(int)wcslen(badge),&sz); SelectObject(dc,of);
         RECT b={x+w-sz.cx-24,y+9,x+w-8,y+29}; card(dc,b,CWARN,CWARN,10); txt(dc,badge,b,fSansXS,RGB(0x18,0x12,0x00),DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
@@ -248,17 +275,17 @@ static void paint(HWND hwnd){
     RECT rail={0,0,RAIL,cr.bottom}; vgrad(dc,rail,CBG2,CBG);
     RECT rl={RAIL-1,0,RAIL,cr.bottom}; fillR(dc,rl,CLINE);
     // brand
-    RECT bmk={22,20,58,56}; txt(dc,L"\uE83D",bmk,fShield,CACC2,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    { RECT bmk={22,20,52,50}; drawIcon(dc,L"shield",bmk,CACC2); }
     RECT bn={62,20,RAIL-8,44}; txt(dc,L"Rescue",bn,fDisp,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     RECT bs={64,44,RAIL-8,62}; txt(dc,L"SECURITY CENTER",bs,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
     int ny=84;
-    navItem(dc,14,ny,RAIL-28,L"\uE80A",L"Dashboard",A_NAV_DASH,true,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"\uE83D",L"Real-time Guard",A_NAV_GUARD,false,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"\uE721",L"Scan",A_NAV_SCAN,false,nullptr);
-    { wchar_t qc[8]; wsprintfW(qc,L"%ld",gThreats); navItem(dc,14,ny,RAIL-28,L"\uE7BA",L"Quarantine",A_NAV_QUAR,false, gThreats>0?qc:nullptr); }
-    navItem(dc,14,ny,RAIL-28,L"\uEDA2",L"Rescue USB",A_NAV_USB,false,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"\uE7C3",L"Logs",A_NAV_LOGS,false,nullptr);
-    navItem(dc,14,ny,RAIL-28,L"\uE713",L"Settings",A_NAV_SET,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"home",L"Dashboard",A_NAV_DASH,true,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"shield",L"Real-time Guard",A_NAV_GUARD,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"search",L"Scan",A_NAV_SCAN,false,nullptr);
+    { wchar_t qc[8]; wsprintfW(qc,L"%ld",gThreats); navItem(dc,14,ny,RAIL-28,L"warn",L"Quarantine",A_NAV_QUAR,false, gThreats>0?qc:nullptr); }
+    navItem(dc,14,ny,RAIL-28,L"usb",L"Rescue USB",A_NAV_USB,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"page",L"Logs",A_NAV_LOGS,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"gear",L"Settings",A_NAV_SET,false,nullptr);
     RECT foot={22,cr.bottom-56,RAIL-14,cr.bottom-12};
     txt(dc,gGuardOn?L"\u25CF  Protected \u00b7 guard live\nRescue 0.1.0 \u00b7 both arches":
                     L"\u25CF  Idle \u00b7 guard off\nRescue 0.1.0 \u00b7 both arches",
@@ -272,7 +299,7 @@ static void paint(HWND hwnd){
     wchar_t clock[32]; SYSTEMTIME st; GetLocalTime(&st); wsprintfW(clock,L"%02d:%02d:%02d",st.wHour,st.wMinute,st.wSecond);
     RECT tc={cr.right-140,0,cr.right-58,58}; txt(dc,clock,tc,fMono,CMUT,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
     RECT tg={cr.right-46,14,cr.right-14,46}; card(dc,tg,CPANEL,CLINE,9);
-    txt(dc,L"\uE713",tg,fIconNav,CMUT,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP); reg(tg,A_NAV_SET);
+    { RECT gi={tg.left+7,tg.top+7,tg.right-7,tg.bottom-7}; drawIcon(dc,L"gear",gi,CMUT); } reg(tg,A_NAV_SET);
 
     int pad=24, cx=X+pad, cw=W-pad*2, y=58+pad;
 
@@ -285,7 +312,7 @@ static void paint(HWND hwnd){
       RoundRect(dc,hero.left,hero.top,hero.right,hero.bottom,14,14); SelectObject(dc,op); SelectObject(dc,obr); DeleteObject(p); }
     // shield
     RECT sh={hero.left+28,hero.top+28,hero.left+156,hero.bottom-28};
-    txt(dc,L"\uE83D",sh,fShield,gGuardOn?CGOOD:CWARN,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    { int d=(sh.bottom-sh.top); RECT si={(sh.left+sh.right-d)/2,sh.top,(sh.left+sh.right-d)/2+d,sh.bottom}; drawIcon(dc,L"shield",si,gGuardOn?CGOOD:CWARN); }
     int hx=hero.left+180;
     RECT he={hx,hero.top+22,hero.right-24,hero.top+42};
     txt(dc,gGuardOn?L"SYSTEM PROTECTED":L"REDUCED PROTECTION",he,fSansXS,gGuardOn?CGOOD:CWARN,DT_LEFT|DT_SINGLELINE);
@@ -331,12 +358,12 @@ static void paint(HWND hwnd){
 
     // ---------------- module grid (3 cols x 2 rows) ----------------
     Mod mods[6]={
-        {L"\uE83D",L"Ransom Guard",L"Behavioral real-time protection", gGuardOn?L"Watching folders \u00b7 6 canaries armed":L"Off \u00b7 turn on to arm canaries", L"Trip \u2192 suspend the busiest writer", 0, gGuardOn?L"Active":L"Off", A_GUARD_TGL},
-        {L"\uE785",L"Lockdown Breaker",L"Undo malware lockdowns", L"Task Mgr \u00b7 regedit \u00b7 CMD \u00b7 shell", L"WDAC policy \u00b7 input lock \u00b7 overlays", 0, L"Ready", A_UNLOCK},
-        {L"\uE8FD",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP},
-        {L"\uE721",L"Threat Scanner",L"Heuristic + hash + quarantine", L"PE entropy \u00b7 MOTW priority", L"Downloads deep-scanned first", 0, L"Updated", A_QUICK},
-        {L"\uE9D9",L"Watchdog",L"Self-protecting service pair", L"Two services \u00b7 each restarts the other", L"Keeps Ransom Guard alive", 0, L"Ready", A_BACKUP},
-        {L"\uE950",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Requires a signed driver to load", 3, L"Not installed", A_NONE},
+        {L"shield",L"Ransom Guard",L"Behavioral real-time protection", gGuardOn?L"Watching folders \u00b7 6 canaries armed":L"Off \u00b7 turn on to arm canaries", L"Trip \u2192 suspend the busiest writer", 0, gGuardOn?L"Active":L"Off", A_GUARD_TGL},
+        {L"unlock",L"Lockdown Breaker",L"Undo malware lockdowns", L"Task Mgr \u00b7 regedit \u00b7 CMD \u00b7 shell", L"WDAC policy \u00b7 input lock \u00b7 overlays", 0, L"Ready", A_UNLOCK},
+        {L"list",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP},
+        {L"search",L"Threat Scanner",L"Heuristic + hash + quarantine", L"PE entropy \u00b7 MOTW priority", L"Downloads deep-scanned first", 0, L"Updated", A_QUICK},
+        {L"dog",L"Watchdog",L"Self-protecting service pair", L"Two services \u00b7 each restarts the other", L"Keeps Ransom Guard alive", 0, L"Ready", A_BACKUP},
+        {L"cpu",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Requires a signed driver to load", 3, L"Not installed", A_NONE},
     };
     mods[2].chipKind=0; // asep neutral unless flagged
     int cols=3, gap=14; int mw=(cw-gap*(cols-1))/cols, mh=124;
