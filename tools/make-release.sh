@@ -11,6 +11,9 @@ mkdir -p "$OUT/x86_64" "$OUT/arm64"
 
 cp build/x86_64/*.exe "$OUT/x86_64/" 2>/dev/null || { echo "build x64 first (make x64)"; exit 1; }
 cp build/arm64/*.exe  "$OUT/arm64/"  2>/dev/null || { echo "build arm64 first (make arm64)"; exit 1; }
+# The cross-compiled (unsigned) driver ships next to its source when built.
+[ -f build/x86_64/rescuemon.sys ] && cp build/x86_64/rescuemon.sys "$OUT/x86_64/"
+[ -f build/arm64/rescuemon.sys ]  && cp build/arm64/rescuemon.sys  "$OUT/arm64/"
 
 cp README.md "$OUT/"
 # Advanced/edge tools (offline WinPE, driver signing) stay as scripts + source,
@@ -19,15 +22,24 @@ mkdir -p "$OUT/advanced/offline" "$OUT/advanced/installer" "$OUT/advanced/driver
 cp offline/*   "$OUT/advanced/offline/"   2>/dev/null || true
 cp installer/* "$OUT/advanced/installer/" 2>/dev/null || true
 cp driver/*    "$OUT/advanced/driver/"    2>/dev/null || true
+[ -f build/x86_64/rescuemon.sys ] && cp build/x86_64/rescuemon.sys "$OUT/advanced/driver/"
 
 cat > "$OUT/START-HERE.txt" <<'TXT'
 RESCUE - anti-ransomware / anti-malware security center
 ======================================================
 
-QUICK START
-  Double-click  x86_64\Rescue.exe   (or  arm64\Rescue.exe  on a Windows-on-ARM
-  PC) and approve the admin prompt. The Security Center window opens - one app,
-  big buttons, real-time protection toggle. Nothing to type.
+QUICK START (recommended: use the installer)
+  Double-click  x86_64\RescueSetup.exe  (or  arm64\RescueSetup.exe  on a
+  Windows-on-ARM PC) and approve the admin prompt. The installer copies Rescue
+  into Program Files, makes Start-menu/Desktop shortcuts, and offers ONE optional
+  checkbox - "Enable kernel protection now". Everything is one program: if you
+  tick it, Rescue signs the driver, deploys its custom Code-Integrity policy, and
+  after a reboot finishes on its own. Uninstall from Add/Remove Programs.
+
+PORTABLE (no install)
+  Or just double-click  x86_64\Rescue.exe  directly - the Security Center opens,
+  one app, big buttons, real-time protection toggle. Kernel protection can be
+  turned on later from the Kernel Filter page.
 
 WHAT WORKS OUT OF THE BOX (no signing, no extra downloads)
   - Scanner            heuristic + hash file scanner, quarantine, scheduled scans
