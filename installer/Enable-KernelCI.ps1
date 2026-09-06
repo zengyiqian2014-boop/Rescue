@@ -52,6 +52,9 @@
 [CmdletBinding()]
 param(
     [switch]$Enforce,
+    [switch]$DisableHVCI,   # opt-in: also turn OFF Memory Integrity (needed for an
+                            # unsigned driver when HVCI is on). Reversible; a real
+                            # security downgrade; never done without this flag.
     [string]$SysPath = ".\rescuemon.sys",
     [string]$InfPath = ".\rescuemon.inf",
     [switch]$Force
@@ -120,6 +123,15 @@ function Request-Consent([string]$mode) {
     Write-Host '   2. Generate a self-signed CODE SIGNING certificate, sign the driver' -ForegroundColor White
     Write-Host '      with it, and trust it in LocalMachine\Root + TrustedPublisher.'
     Write-Host '   3. Register + (in ENFORCE mode) load the RescueMon minifilter.'      -ForegroundColor White
+    if ($DisableHVCI) {
+        Write-Host ''
+        Write-Host '   4. TURN OFF Memory Integrity (HVCI).'                              -ForegroundColor Red
+        Write-Host '      HVCI otherwise requires a Microsoft-rooted signature for kernel' -ForegroundColor Yellow
+        Write-Host '      code and a WDAC hash rule does not satisfy it. Turning it off'   -ForegroundColor Yellow
+        Write-Host '      lowers this machine''s kernel-memory protection for EVERY driver,'-ForegroundColor Yellow
+        Write-Host '      not just ours, and takes effect after a reboot. Restore-KernelCI'-ForegroundColor Yellow
+        Write-Host '      turns it back on.'                                               -ForegroundColor Yellow
+    }
     Write-Host ''
     Write-Host '  It does NOT change Secure Boot or Memory Integrity, and does NOT'
     Write-Host '  delete any existing policy (touched files are copied to .bak).'
@@ -157,15 +169,29 @@ if ($hvci -eq 'On') {
     Write-Host ''
     Write-Host '  [!] Memory Integrity (HVCI) is ON. A WDAC hash rule does NOT satisfy'   -ForegroundColor Yellow
     Write-Host '      HVCI: the hypervisor still requires a Microsoft-rooted signature,'  -ForegroundColor Yellow
-    Write-Host '      so this unsigned driver will still not load. The only path with'    -ForegroundColor Yellow
-    Write-Host '      HVCI on is Microsoft attestation signing. This script will NOT'      -ForegroundColor Yellow
-    Write-Host '      turn HVCI off for you - decide that yourself, in Windows Security.'  -ForegroundColor Yellow
+    Write-Host '      so this unsigned driver will still not load. Options: sign the'     -ForegroundColor Yellow
+    Write-Host '      driver via Microsoft attestation, or re-run this with -DisableHVCI'  -ForegroundColor Yellow
+    Write-Host '      to turn Memory Integrity off (opt-in, reversible, security cost).'   -ForegroundColor Yellow
 }
 
 if (-not $Force) { if (-not (Request-Consent $mode)) { exit 1 } }
 else { Write-Host '  -Force: consent prompt skipped by operator.' -ForegroundColor Yellow }
 
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+
+# ---- 0. optionally turn off Memory Integrity (HVCI), opt-in only --------------
+$hvciDisabled=$false
+if ($DisableHVCI -and $hvci -eq 'On') {
+    Write-Head 'Memory Integrity (HVCI)'
+    $key='HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'Enabled' -Value 0 -PropertyType DWord -Force | Out-Null
+    $hvciDisabled=$true
+    Write-Item 'HVCI' 'turned OFF - reboot required to take effect' 'Red'
+    Write-Item 'reverse with' 'Restore-KernelCI.ps1' 'Gray'
+} elseif ($DisableHVCI) {
+    Write-Item 'HVCI' 'already off - nothing to change' 'Gray'
+}
 
 # ---- 1. self-sign the driver (Code Signing EKU only) --------------------------
 Write-Head 'Signing the driver'
@@ -293,6 +319,7 @@ Save-State ([pscustomobject]@{
     BackupsCreated = $backups
     SecureBoot     = $secureBoot
     Hvci           = $hvci
+    HvciDisabledByUs = $hvciDisabled
 })
 
 Write-Host ''

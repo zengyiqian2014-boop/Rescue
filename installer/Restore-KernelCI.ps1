@@ -91,6 +91,15 @@ if ($state.PSObject.Properties.Name -contains 'BackupsCreated' -and $state.Backu
     }
 }
 
+# ---- 3b. re-enable Memory Integrity if we turned it off ----------------------
+if (($state.PSObject.Properties.Name -contains 'HvciDisabledByUs') -and $state.HvciDisabledByUs) {
+    Write-Head 'Memory Integrity (HVCI)'
+    $key='HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'Enabled' -Value 1 -PropertyType DWord -Force | Out-Null
+    Write-Item 'HVCI' 're-enabled - reboot required to take effect' 'Green'
+}
+
 # ---- 4. remove the self-signed cert -----------------------------------------
 Write-Head 'Certificate'
 $thumb = $state.CertThumbprint

@@ -87,7 +87,7 @@ enum {
     A_NONE=0, A_QUICK, A_FULL, A_USB, A_GUARD_TGL, A_UNLOCK, A_ASEP, A_BACKUP,
     A_QUAR_OPEN, A_NAV_DASH, A_NAV_GUARD, A_NAV_SCAN, A_NAV_QUAR, A_NAV_USB,
     A_NAV_LOGS, A_NAV_SET, A_NAV_KERNEL,
-    A_KERNEL_AUDIT, A_KERNEL_ENFORCE, A_KERNEL_RESTORE
+    A_KERNEL_AUDIT, A_KERNEL_ENFORCE, A_KERNEL_ENFORCE_NOHVCI, A_KERNEL_RESTORE
 };
 
 struct Hit { RECT rc; int action; };
@@ -238,6 +238,8 @@ static void doAction(int a){
         runKernelScript(L"Enable-KernelCI.ps1",nullptr); break;
     case A_KERNEL_ENFORCE: feedAdd(EV_WARN,L"Kernel CI: enforce",L"Deploying custom CI in enforce mode + loading driver");
         runKernelScript(L"Enable-KernelCI.ps1",L"-Enforce"); break;
+    case A_KERNEL_ENFORCE_NOHVCI: feedAdd(EV_CRIT,L"Kernel CI: enforce + HVCI off",L"Enforce + turn off Memory Integrity (asks for typed consent)");
+        runKernelScript(L"Enable-KernelCI.ps1",L"-Enforce -DisableHVCI"); break;
     case A_KERNEL_RESTORE: feedAdd(EV_INFO,L"Kernel CI: restore",L"Removing custom CI, restoring original configuration");
         runKernelScript(L"Restore-KernelCI.ps1",nullptr); break;
     // ---- actions ----
@@ -497,9 +499,10 @@ static void drawKernelPage(HDC dc,int cx,int cy,int cw,RECT cr){
         ds,fSansS,CMUT,DT_LEFT|DT_WORDBREAK);
     // buttons row
     int by=c.bottom-52;
-    RECT b1={c.left+24,by,c.left+204,by+40}; pageBtn(dc,b1,L"Enable (audit)",A_KERNEL_AUDIT,true);
-    RECT b2={c.left+216,by,c.left+392,by+40}; pageBtn(dc,b2,L"Enable (enforce)",A_KERNEL_ENFORCE,false);
-    RECT b3={c.left+404,by,c.left+588,by+40}; pageBtn(dc,b3,L"Restore original CI",A_KERNEL_RESTORE,false);
+    RECT b1={c.left+24,by,c.left+178,by+40};  pageBtn(dc,b1,L"Enable (audit)",A_KERNEL_AUDIT,true);
+    RECT b2={c.left+190,by,c.left+304,by+40}; pageBtn(dc,b2,L"Enforce",A_KERNEL_ENFORCE,false);
+    RECT b3={c.left+316,by,c.left+498,by+40}; pageBtn(dc,b3,L"Enforce · HVCI off",A_KERNEL_ENFORCE_NOHVCI,false);
+    RECT b4={c.left+510,by,c.left+664,by+40}; pageBtn(dc,b4,L"Restore CI",A_KERNEL_RESTORE,false);
     RECT act={cx,c.bottom+pad,cx+cw,cr.bottom-pad}; if(act.bottom-act.top>120) drawFeedCard(dc,act);
 }
 static void drawSimplePage(HDC dc,int cx,int cy,int cw,RECT cr,const wchar_t* icon,const wchar_t* title,const wchar_t* desc,const wchar_t* btn,int action){
