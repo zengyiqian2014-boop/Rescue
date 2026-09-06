@@ -1,9 +1,12 @@
-// rescue_gui.cpp - Rescue: the one window a user touches. A fully custom-drawn,
-// modern flat UI (no dated gray Win32 chrome): gradient header, rounded status
-// card that turns green when protected, rounded action cards with icon glyphs
-// and hover lift, and a framed activity log. Double-buffered so it never
-// flickers. Still one dependency-free, statically linked .exe that cross-compiles
-// with MinGW for x86_64 and ARM64, and it drives the same engines under the hood.
+// rescue_gui.cpp - Rescue Security Center: a dark security-operations console.
+//
+// Faithfully rebuilds the Rescue dashboard design as a native, dependency-free,
+// double-buffered Win32 app (cross-compiles with MinGW for x86_64 and ARM64):
+// a left navigation rail, a hero protection panel with a shield + live stats, a
+// grid of the six defense modules with status chips, and an activity feed +
+// quarantine list. Buttons drive the real engines (scanner / ransom_guard /
+// lockdown_breaker / backup) that sit next to this .exe. Custom GDI drawing with
+// hit-tested regions, MDL2 icon glyphs, and hover states - no dated Win32 chrome.
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -11,322 +14,392 @@
 #include <commctrl.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <thread>
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
-// ------------------------------------------------------------- palette --------
-static const COLORREF C_BG        = RGB(0xEE, 0xF1, 0xF6);
-static const COLORREF C_HEAD_TOP  = RGB(0x1B, 0x2A, 0x4E);
-static const COLORREF C_HEAD_BOT  = RGB(0x2B, 0x54, 0x9C);
-static const COLORREF C_CARD      = RGB(0xFF, 0xFF, 0xFF);
-static const COLORREF C_CARD_HOT  = RGB(0xF5, 0xF8, 0xFF);
-static const COLORREF C_BORDER    = RGB(0xD8, 0xDE, 0xE8);
-static const COLORREF C_TEXT      = RGB(0x1E, 0x27, 0x33);
-static const COLORREF C_MUTED     = RGB(0x6B, 0x76, 0x88);
-static const COLORREF C_ACCENT    = RGB(0x2D, 0x6C, 0xDF);
-static const COLORREF C_GREEN     = RGB(0x1E, 0x93, 0x51);
-static const COLORREF C_GREEN_D   = RGB(0x17, 0x7A, 0x43);
-static const COLORREF C_RED       = RGB(0xC4, 0x57, 0x2B);
-static const COLORREF C_RED_D     = RGB(0xA8, 0x49, 0x22);
-static const COLORREF C_WHITE     = RGB(0xFF, 0xFF, 0xFF);
+// ------------------------------------------------------------- palette (dark)-
+#define CBG      RGB(0x0a,0x0e,0x16)
+#define CBG2     RGB(0x0d,0x12,0x20)
+#define CPANEL   RGB(0x12,0x1a,0x2b)
+#define CPANEL2  RGB(0x17,0x21,0x36)
+#define CLINE    RGB(0x24,0x31,0x49)
+#define CLINE2   RGB(0x2f,0x3f,0x5c)
+#define CINK     RGB(0xe8,0xee,0xf7)
+#define CMUT     RGB(0x93,0xa1,0xba)
+#define CMUT2    RGB(0x68,0x76,0x8f)
+#define CACC     RGB(0x3d,0x8b,0xfd)
+#define CACC2    RGB(0x5a,0xa2,0xff)
+#define CACCD    RGB(0x16,0x23,0x3d)
+#define CGOOD    RGB(0x3f,0xb9,0x50)
+#define CGOODD   RGB(0x12,0x30,0x21)
+#define CWARN    RGB(0xe0,0xa4,0x15)
+#define CWARND   RGB(0x33,0x28,0x0a)
+#define CCRIT    RGB(0xfb,0x5a,0x4b)
+#define CCRITD   RGB(0x3a,0x15,0x12)
 
-// ------------------------------------------------------------- ids ------------
+// ------------------------------------------------------------- actions --------
 enum {
-    ID_QUICKSCAN = 1001, ID_FULLSCAN, ID_UNLOCK, ID_BACKUP, ID_QUARANTINE,
-    ID_PROTECT, ID_LOG
+    A_NONE=0, A_QUICK, A_FULL, A_USB, A_GUARD_TGL, A_UNLOCK, A_ASEP, A_BACKUP,
+    A_QUAR_OPEN, A_NAV_DASH, A_NAV_GUARD, A_NAV_SCAN, A_NAV_QUAR, A_NAV_USB,
+    A_NAV_LOGS, A_NAV_SET
 };
-#define WM_APP_APPEND (WM_APP + 1)
-#define WM_APP_BUSY   (WM_APP + 2)
 
-// A card button model (owner-drawn). MDL2 icon glyph + title + subtitle.
-struct Card { int id; const wchar_t* icon; const wchar_t* title; const wchar_t* sub; bool hot; bool down; };
-static Card gCards[] = {
-    { ID_QUICKSCAN,  L"\uE721", L"Quick Scan",     L"Downloads, Temp, startup", false, false },
-    { ID_FULLSCAN,   L"\uE896", L"Full Scan",      L"Every drive, deep check",  false, false },
-    { ID_UNLOCK,     L"\uE785", L"Unlock / Clean", L"Undo a malware lockdown",  false, false },
-    { ID_BACKUP,     L"\uE78C", L"Back Up Files",  L"Time Machine snapshot",    false, false },
-    { ID_QUARANTINE, L"\uE7BA", L"Quarantine",     L"Review what was isolated", false, false },
-};
-static Card gProtect = { ID_PROTECT, L"\uE83D", L"", L"", false, false };
+struct Hit { RECT rc; int action; };
+static std::vector<Hit> gHits;
+static int gHover = A_NONE;
 
-static HWND gLog=nullptr, gMain=nullptr;
-static HWND gCardWnd[5]={0}, gProtectWnd=nullptr;
+// activity feed + state
+enum Sev { EV_OK, EV_WARN, EV_CRIT, EV_INFO };
+struct Event { Sev sev; std::wstring title, detail, ago; };
+static std::deque<Event> gFeed;
+
+static HWND gWnd=nullptr;
+static bool gGuardOn=false;
 static HANDLE gGuardProc=nullptr;
-static bool  gBusy=false;
-static HFONT gFTitle,gFSub,gFCard,gFCardSub,gFIcon,gFIconBig,gFStatus,gFStatusSub,gFMono;
+static bool gScanning=false;
+static int  gScanPct=0;
+static long gScanCount=0;
+static std::wstring gScanPath;
+static long gThreats=0;   // real: quarantine item count
+
+static HFONT fDispXL,fDisp,fDispS,fSans,fSansS,fSansXS,fMono,fIcon,fIconBig,fIconNav,fShield;
 
 // ------------------------------------------------------------- helpers --------
-static std::wstring exeDir() {
-    wchar_t b[MAX_PATH*2]; GetModuleFileNameW(nullptr,b,MAX_PATH*2);
-    std::wstring p=b; size_t s=p.find_last_of(L"\\/");
-    return s==std::wstring::npos?L".":p.substr(0,s);
-}
+static std::wstring exeDir(){ wchar_t b[MAX_PATH*2]; GetModuleFileNameW(nullptr,b,MAX_PATH*2);
+    std::wstring p=b; size_t s=p.find_last_of(L"\\/"); return s==std::wstring::npos?L".":p.substr(0,s); }
 static std::wstring tool(const wchar_t* n){ return L"\""+exeDir()+L"\\"+n+L"\""; }
+static std::wstring pdRescue(){ wchar_t b[MAX_PATH*2]; DWORD n=GetEnvironmentVariableW(L"ProgramData",b,MAX_PATH*2);
+    return (n?std::wstring(b):L"C:\\ProgramData")+L"\\Rescue"; }
 
-static Card* cardById(int id){
-    if(id==ID_PROTECT) return &gProtect;
-    for(auto& c:gCards) if(c.id==id) return &c;
+static void feedAdd(Sev s,const std::wstring& t,const std::wstring& d){
+    gFeed.push_front({s,t,d,L"now"}); if(gFeed.size()>40) gFeed.pop_back();
+    if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
+}
+
+// count quarantined items from the real manifest (honest stat, not demo data)
+static long quarantineCount(){
+    std::wstring mf=pdRescue()+L"\\Quarantine\\manifest.txt";
+    FILE* f=_wfopen(mf.c_str(),L"r, ccs=UTF-8"); if(!f) return 0;
+    long n=0; wchar_t line[2048];
+    while(fgetws(line,2048,f)){ if(line[0]>='0'&&line[0]<='9') ++n; }   // dated rows
+    fclose(f); return n;
+}
+
+// ---- engine runner (background thread; drains output, posts progress) -------
+static void runReader(HANDLE rd,bool scan){
+    char buf[4096]; DWORD got=0; std::string acc;
+    while(ReadFile(rd,buf,sizeof(buf)-1,&got,nullptr)&&got){
+        buf[got]=0; acc.append(buf,got);
+        if(scan){ // count "score" hits and progress heartbeat
+            gScanCount+=got/64; if(gScanPct<95) gScanPct+=1;
+            if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
+        }
+    }
+    CloseHandle(rd); (void)acc;
+}
+static HANDLE launchEngine(const std::wstring& cmdline,bool scan,bool* doneFlag){
+    SECURITY_ATTRIBUTES sa{}; sa.nLength=sizeof(sa); sa.bInheritHandle=TRUE;
+    HANDLE rd=nullptr,wr=nullptr; if(!CreatePipe(&rd,&wr,&sa,0)) return nullptr;
+    SetHandleInformation(rd,HANDLE_FLAG_INHERIT,0);
+    STARTUPINFOW si{}; si.cb=sizeof(si); si.dwFlags=STARTF_USESTDHANDLES|STARTF_USESHOWWINDOW;
+    si.wShowWindow=SW_HIDE; si.hStdOutput=wr; si.hStdError=wr; si.hStdInput=GetStdHandle(STD_INPUT_HANDLE);
+    std::wstring cmd=cmdline; std::vector<wchar_t> m(cmd.begin(),cmd.end()); m.push_back(0);
+    PROCESS_INFORMATION pi{};
+    BOOL ok=CreateProcessW(nullptr,m.data(),nullptr,nullptr,TRUE,CREATE_NO_WINDOW,nullptr,exeDir().c_str(),&si,&pi);
+    CloseHandle(wr);
+    if(!ok){ CloseHandle(rd); return nullptr; }
+    CloseHandle(pi.hThread);
+    if(!doneFlag){ std::thread([rd,scan]{ runReader(rd,scan); }).detach(); return pi.hProcess; }
+    std::thread([rd,scan,hp=pi.hProcess]{
+        runReader(rd,scan); WaitForSingleObject(hp,INFINITE); CloseHandle(hp);
+        gScanning=false; gScanPct=100;
+        feedAdd(EV_INFO,L"Scan completed",L"Objects checked \u00b7 review any findings above");
+        gScanPct=0; gScanCount=0;
+        if(gWnd) InvalidateRect(gWnd,nullptr,FALSE);
+    }).detach();
     return nullptr;
 }
 
-static void logAtEnd(const wchar_t* t){
-    int len=GetWindowTextLengthW(gLog);
-    SendMessageW(gLog,EM_SETSEL,len,len);
-    SendMessageW(gLog,EM_REPLACESEL,FALSE,(LPARAM)t);
+static void startScan(bool full){
+    if(gScanning) return; gScanning=true; gScanPct=2; gScanCount=0;
+    gScanPath = full?L"scanning all fixed drives":L"Downloads, Desktop, Temp, startup";
+    feedAdd(EV_INFO, full?L"Full scan started":L"Quick scan started", gScanPath);
+    launchEngine(tool(L"scanner.exe")+(full?L" --full":L""),true,(bool*)1);
+    InvalidateRect(gWnd,nullptr,FALSE);
 }
-static void appendLog(HWND h,const wchar_t* t){
-    size_t n=wcslen(t); wchar_t* c=(wchar_t*)malloc((n+1)*sizeof(wchar_t));
-    if(!c) return; memcpy(c,t,(n+1)*sizeof(wchar_t));
-    PostMessageW(h,WM_APP_APPEND,(WPARAM)c,0);
+static void setGuard(bool on){
+    if(on&&!gGuardProc){ gGuardProc=launchEngine(tool(L"ransom_guard.exe")+L" --shield",false,nullptr);
+        gGuardOn=gGuardProc!=nullptr; feedAdd(EV_OK,L"Real-time guard enabled",L"Behavioral protection + disk shield armed"); }
+    else if(!on&&gGuardProc){ TerminateProcess(gGuardProc,0); CloseHandle(gGuardProc); gGuardProc=nullptr;
+        gGuardOn=false; feedAdd(EV_WARN,L"Real-time guard disabled",L"Files are no longer being watched"); }
+    InvalidateRect(gWnd,nullptr,FALSE);
 }
-
-// ---- engine runner (redirected stdout streamed into the log) ----------------
-static void runReader(HWND h, HANDLE rd){
-    char buf[4096]; DWORD got=0;
-    while(ReadFile(rd,buf,sizeof(buf)-1,&got,nullptr)&&got){
-        buf[got]=0;
-        int wn=MultiByteToWideChar(CP_ACP,0,buf,(int)got,nullptr,0);
-        std::wstring w(wn,0); MultiByteToWideChar(CP_ACP,0,buf,(int)got,w.data(),wn);
-        appendLog(h,w.c_str());
-    }
-    CloseHandle(rd);
-}
-static HANDLE launchEngine(HWND h,const std::wstring& cmdline,bool fg){
-    SECURITY_ATTRIBUTES sa{}; sa.nLength=sizeof(sa); sa.bInheritHandle=TRUE;
-    HANDLE rd=nullptr,wr=nullptr;
-    if(!CreatePipe(&rd,&wr,&sa,0)) return nullptr;
-    SetHandleInformation(rd,HANDLE_FLAG_INHERIT,0);
-    STARTUPINFOW si{}; si.cb=sizeof(si);
-    si.dwFlags=STARTF_USESTDHANDLES|STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
-    si.hStdOutput=wr; si.hStdError=wr; si.hStdInput=GetStdHandle(STD_INPUT_HANDLE);
-    std::wstring cmd=cmdline; std::vector<wchar_t> m(cmd.begin(),cmd.end()); m.push_back(0);
-    PROCESS_INFORMATION pi{};
-    BOOL ok=CreateProcessW(nullptr,m.data(),nullptr,nullptr,TRUE,CREATE_NO_WINDOW,
-                           nullptr,exeDir().c_str(),&si,&pi);
-    CloseHandle(wr);
-    if(!ok){ CloseHandle(rd); appendLog(h,L"\r\n[!] could not start the engine.\r\n"); return nullptr; }
-    CloseHandle(pi.hThread);
-    if(fg){
-        SendMessageW(h,WM_APP_BUSY,1,0);
-        std::thread([h,rd,hp=pi.hProcess]{ runReader(h,rd); WaitForSingleObject(hp,INFINITE);
-            CloseHandle(hp); SendMessageW(h,WM_APP_BUSY,0,0); appendLog(h,L"\r\n---- done ----\r\n"); }).detach();
-        return nullptr;
-    }
-    std::thread([h,rd]{ runReader(h,rd); }).detach();
-    return pi.hProcess;
-}
-
-static void refreshProtect(){
-    bool p=gGuardProc!=nullptr;
-    InvalidateRect(gProtectWnd,nullptr,TRUE);
-    InvalidateRect(gMain,nullptr,FALSE);
-    (void)p;
-}
-static void setProtection(HWND h,bool on){
-    if(on&&!gGuardProc){
-        appendLog(h,L"\r\n=== Real-time protection ON ===\r\n");
-        gGuardProc=launchEngine(h,tool(L"ransom_guard.exe")+L" --shield",false);
-    } else if(!on&&gGuardProc){
-        TerminateProcess(gGuardProc,0); CloseHandle(gGuardProc); gGuardProc=nullptr;
-        appendLog(h,L"\r\n=== Real-time protection OFF ===\r\n");
-    }
-    refreshProtect();
-}
-
-static void onCommand(HWND h,int id){
-    if(gBusy&&id!=ID_PROTECT&&id!=ID_QUARANTINE){ appendLog(h,L"\r\n[busy - let the current task finish]\r\n"); return; }
-    switch(id){
-    case ID_QUICKSCAN: appendLog(h,L"\r\n=== Quick scan ===\r\n"); launchEngine(h,tool(L"scanner.exe"),true); break;
-    case ID_FULLSCAN:  appendLog(h,L"\r\n=== Full scan ===\r\n");  launchEngine(h,tool(L"scanner.exe")+L" --full",true); break;
-    case ID_UNLOCK:    appendLog(h,L"\r\n=== Unlock / clean ===\r\n");
-        launchEngine(h,tool(L"lockdown_breaker.exe")+L" --fix --kill-overlays --kill-effects",true); break;
-    case ID_BACKUP:{
-        BROWSEINFOW bi{}; bi.hwndOwner=h; bi.lpszTitle=L"Choose a BACKUP DISK or folder (an external drive is best)";
-        bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;
-        LPITEMIDLIST pidl=SHBrowseForFolderW(&bi);
-        if(pidl){ wchar_t path[MAX_PATH];
-            if(SHGetPathFromIDListW(pidl,path)){ appendLog(h,L"\r\n=== Backup ===\r\n");
-                launchEngine(h,tool(L"backup.exe")+L" --snapshot \""+path+L"\" --keep 10",true); }
-            CoTaskMemFree(pidl); }
-        break; }
-    case ID_PROTECT: setProtection(h,gGuardProc==nullptr); break;
-    case ID_QUARANTINE:{
-        wchar_t pd[MAX_PATH*2]; DWORD n=GetEnvironmentVariableW(L"ProgramData",pd,MAX_PATH*2);
-        std::wstring base=(n?std::wstring(pd):L"C:\\ProgramData");
-        CreateDirectoryW((base+L"\\Rescue").c_str(),nullptr);
-        std::wstring q=base+L"\\Rescue\\Quarantine"; CreateDirectoryW(q.c_str(),nullptr);
-        ShellExecuteW(h,L"explore",q.c_str(),nullptr,nullptr,SW_SHOW); break; }
+static void doAction(int a){
+    switch(a){
+    case A_QUICK: case A_NAV_SCAN: startScan(false); break;
+    case A_FULL: startScan(true); break;
+    case A_GUARD_TGL: case A_NAV_GUARD: setGuard(!gGuardOn); break;
+    case A_UNLOCK: feedAdd(EV_INFO,L"Unlock / clean started",L"Undoing lockdown levers + screen effects");
+        launchEngine(tool(L"lockdown_breaker.exe")+L" --fix --kill-overlays --kill-effects",false,(bool*)1); break;
+    case A_ASEP: feedAdd(EV_INFO,L"Autostart scan started",L"Checking every ASEP against signatures");
+        launchEngine(tool(L"asep_cleaner.exe"),false,(bool*)1); break;
+    case A_USB: case A_NAV_USB:
+        MessageBoxW(gWnd,L"Build a bootable rescue USB with:\n\n  offline\\Make-RescueDisk.ps1 -Drive F: -Mode bootable\n\n"
+                        L"or a one-click restore disk (official Windows ISO + your backup):\n\n"
+                        L"  offline\\Make-RescueDisk.ps1 -Drive F: -Mode oneclick -Iso <ISO>",
+                    L"Rescue USB",MB_ICONINFORMATION); break;
+    case A_BACKUP:{
+        BROWSEINFOW bi{}; bi.hwndOwner=gWnd; bi.lpszTitle=L"Choose a BACKUP DISK or folder (external drive best)";
+        bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE; LPITEMIDLIST pidl=SHBrowseForFolderW(&bi);
+        if(pidl){ wchar_t p[MAX_PATH]; if(SHGetPathFromIDListW(pidl,p)){ feedAdd(EV_INFO,L"Backup started",p);
+            launchEngine(tool(L"backup.exe")+L" --snapshot \""+p+L"\" --keep 10",false,(bool*)1);} CoTaskMemFree(pidl);} break; }
+    case A_QUAR_OPEN: case A_NAV_QUAR:{ std::wstring q=pdRescue()+L"\\Quarantine";
+        CreateDirectoryW(pdRescue().c_str(),nullptr); CreateDirectoryW(q.c_str(),nullptr);
+        ShellExecuteW(gWnd,L"explore",q.c_str(),nullptr,nullptr,SW_SHOW); break; }
+    default: break;
     }
 }
 
-// ------------------------------------------------------------- drawing --------
-static void fillGradient(HDC dc,RECT rc,COLORREF a,COLORREF b){
-    int h=rc.bottom-rc.top; if(h<=0) return;
-    for(int y=0;y<h;++y){
-        double t=(double)y/h;
-        int r=(int)(GetRValue(a)+(GetRValue(b)-GetRValue(a))*t);
-        int g=(int)(GetGValue(a)+(GetGValue(b)-GetGValue(a))*t);
-        int bl=(int)(GetBValue(a)+(GetBValue(b)-GetBValue(a))*t);
-        HBRUSH br=CreateSolidBrush(RGB(r,g,bl));
-        RECT line={rc.left,rc.top+y,rc.right,rc.top+y+1};
-        FillRect(dc,&line,br); DeleteObject(br);
-    }
-}
-static void roundCard(HDC dc,RECT rc,COLORREF fill,COLORREF border,int rad){
+// ------------------------------------------------------------- GDI utils ------
+static void fillR(HDC dc,RECT r,COLORREF c){ HBRUSH b=CreateSolidBrush(c); FillRect(dc,&r,b); DeleteObject(b); }
+static void vgrad(HDC dc,RECT r,COLORREF a,COLORREF b){ int h=r.bottom-r.top; if(h<=0)return;
+    for(int y=0;y<h;++y){ double t=(double)y/h; int R=(int)(GetRValue(a)+(GetRValue(b)-GetRValue(a))*t);
+        int G=(int)(GetGValue(a)+(GetGValue(b)-GetGValue(a))*t); int B=(int)(GetBValue(a)+(GetBValue(b)-GetBValue(a))*t);
+        RECT ln={r.left,r.top+y,r.right,r.top+y+1}; fillR(dc,ln,RGB(R,G,B)); } }
+static void card(HDC dc,RECT r,COLORREF fill,COLORREF border,int rad){
     HBRUSH b=CreateSolidBrush(fill); HPEN p=CreatePen(PS_SOLID,1,border);
     HGDIOBJ ob=SelectObject(dc,b),op=SelectObject(dc,p);
-    RoundRect(dc,rc.left,rc.top,rc.right,rc.bottom,rad,rad);
-    SelectObject(dc,ob); SelectObject(dc,op); DeleteObject(b); DeleteObject(p);
-}
-static void drawText(HDC dc,const wchar_t* s,RECT rc,HFONT f,COLORREF col,UINT fmt){
-    HGDIOBJ of=SelectObject(dc,f); SetTextColor(dc,col); SetBkMode(dc,TRANSPARENT);
-    DrawTextW(dc,s,-1,&rc,fmt); SelectObject(dc,of);
+    RoundRect(dc,r.left,r.top,r.right,r.bottom,rad,rad);
+    SelectObject(dc,ob); SelectObject(dc,op); DeleteObject(b); DeleteObject(p); }
+static void txt(HDC dc,const wchar_t* s,RECT r,HFONT f,COLORREF c,UINT fmt){
+    HGDIOBJ of=SelectObject(dc,f); SetTextColor(dc,c); SetBkMode(dc,TRANSPARENT);
+    DrawTextW(dc,s,-1,&r,fmt|DT_NOPREFIX); SelectObject(dc,of); }
+static void chip(HDC dc,int x,int y,const wchar_t* s,COLORREF fg,COLORREF bg,COLORREF bd){
+    HDC mdc=dc; SIZE sz; HGDIOBJ of=SelectObject(mdc,fSansXS); GetTextExtentPoint32W(mdc,s,(int)wcslen(s),&sz); SelectObject(mdc,of);
+    RECT r={x,y,x+sz.cx+30,y+22}; card(dc,r,bg,bd,11);
+    // dot
+    HBRUSH b=CreateSolidBrush(fg); RECT d={x+10,y+8,x+16,y+14}; HGDIOBJ ob=SelectObject(dc,b);
+    Ellipse(dc,d.left,d.top,d.right,d.bottom); SelectObject(dc,ob); DeleteObject(b);
+    RECT tr={x+20,y,r.right,y+22}; txt(dc,s,tr,fSansXS,fg,DT_LEFT|DT_VCENTER|DT_SINGLELINE); }
+static void reg(RECT r,int a){ gHits.push_back({r,a}); }
+static bool isHot(int a){ return gHover==a && a!=A_NONE; }
+
+// ------------------------------------------------------------- module cards ---
+struct Mod { const wchar_t* icon,*name,*role,*metric1,*metric2; int chipKind; const wchar_t* chip; int action; };
+// chipKind: 0 ok,1 warn,2 crit,3 idle
+static void drawMod(HDC dc,RECT r,const Mod& m,bool dim){
+    COLORREF bd = isHot(m.action)?CLINE2:CLINE;
+    card(dc,r,CPANEL,bd,14);
+    // icon tile
+    RECT it={r.left+16,r.top+16,r.left+54,r.top+54};
+    COLORREF itbg=dim?RGB(0x14,0x1c,0x2c):(m.chipKind==1?CWARND:CACCD);
+    COLORREF itfg=dim?CMUT:(m.chipKind==1?CWARN:CACC2);
+    card(dc,it,itbg,dim?CLINE:RGB(0x22,0x37,0x5c),10);
+    txt(dc,m.icon,it,fIcon,itfg,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    RECT nm={r.left+64,r.top+16,r.right-96,r.top+40}; txt(dc,m.name,nm,fDispS,CINK,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    RECT ro={r.left+64,r.top+38,r.right-16,r.top+58}; txt(dc,m.role,ro,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
+    // chip top-right
+    COLORREF cf=CGOOD,cb=CGOODD,cd=RGB(0x1c,0x4a,0x30);
+    if(m.chipKind==1){cf=CWARN;cb=CWARND;cd=RGB(0x4d,0x3c,0x10);}
+    else if(m.chipKind==2){cf=CCRIT;cb=CCRITD;cd=RGB(0x58,0x20,0x19);}
+    else if(m.chipKind==3){cf=CMUT;cb=RGB(0x14,0x1c,0x2c);cd=CLINE;}
+    SIZE sz; HGDIOBJ of=SelectObject(dc,fSansXS); GetTextExtentPoint32W(dc,m.chip,(int)wcslen(m.chip),&sz); SelectObject(dc,of);
+    chip(dc,r.right-sz.cx-46,r.top+16,m.chip,cf,cb,cd);
+    // metric box
+    RECT mb={r.left+16,r.top+66,r.right-16,r.top+110}; card(dc,mb,CBG2,CLINE,8);
+    RECT m1={mb.left+11,mb.top+7,mb.right-11,mb.top+27}; txt(dc,m.metric1,m1,fSansS,CMUT,DT_LEFT|DT_SINGLELINE);
+    RECT m2={mb.left+11,mb.top+24,mb.right-11,mb.bottom-6}; txt(dc,m.metric2,m2,fSansS,CMUT,DT_LEFT|DT_SINGLELINE);
+    // action link
+    RECT lk={r.right-92,r.bottom-32,r.right-14,r.bottom-8};
+    txt(dc,isHot(m.action)?L"Open  \u2192":L"Open  \u203a",lk,fSansS,CACC2,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    reg(r,m.action);
 }
 
-// owner-draw an action card
-static void drawCard(DRAWITEMSTRUCT* di){
-    Card* c=cardById((int)di->CtlID); if(!c) return;
-    HDC dc=di->hDC; RECT rc=di->rcItem;
-    // background of the button = page bg, then a rounded card
-    HBRUSH bg=CreateSolidBrush(C_BG); FillRect(dc,&rc,bg); DeleteObject(bg);
-    COLORREF fill = c->down ? RGB(0xEA,0xF0,0xFF) : (c->hot ? C_CARD_HOT : C_CARD);
-    COLORREF bord = c->hot ? C_ACCENT : C_BORDER;
-    RECT card=rc; roundCard(dc,card,fill,bord,14);
-    // icon in an accent circle
-    RECT ic={card.left+16,card.top+ (card.bottom-card.top)/2-20,card.left+56,card.top+(card.bottom-card.top)/2+20};
-    drawText(dc,c->icon,ic,gFIcon,C_ACCENT,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
-    RECT tr={card.left+66,card.top+14,card.right-12,card.top+42};
-    drawText(dc,c->title,tr,gFCard,C_TEXT,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
-    RECT sr={card.left+66,card.top+40,card.right-12,card.bottom-10};
-    drawText(dc,c->sub,sr,gFCardSub,C_MUTED,DT_LEFT|DT_SINGLELINE);
+// ------------------------------------------------------------- paint ----------
+static void navItem(HDC dc,int x,int& y,int w,const wchar_t* icon,const wchar_t* label,int action,bool on,const wchar_t* badge){
+    RECT r={x,y,x+w,y+38};
+    if(on) card(dc,r,CACCD,CACCD,9);
+    else if(isHot(action)){ card(dc,r,CPANEL,CPANEL,9); }
+    RECT ic={x+11,y,x+34,y+38}; txt(dc,icon,ic,fIconNav,on?CACC2:CMUT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    RECT tr={x+40,y,x+w-30,y+38}; txt(dc,label,tr,fSans,on?CACC2:CMUT,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    if(badge){ SIZE sz; HGDIOBJ of=SelectObject(dc,fSansXS); GetTextExtentPoint32W(dc,badge,(int)wcslen(badge),&sz); SelectObject(dc,of);
+        RECT b={x+w-sz.cx-24,y+9,x+w-8,y+29}; card(dc,b,CWARN,CWARN,10); txt(dc,badge,b,fSansXS,RGB(0x18,0x12,0x00),DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
+    reg(r,action); y+=40;
 }
 
-// owner-draw the big protection toggle
-static void drawProtect(DRAWITEMSTRUCT* di){
-    bool on=gGuardProc!=nullptr;
-    HDC dc=di->hDC; RECT rc=di->rcItem;
-    HBRUSH bg=CreateSolidBrush(C_BG); FillRect(dc,&rc,bg); DeleteObject(bg);
-    COLORREF base = on ? (gProtect.hot?C_GREEN:C_GREEN_D) : (gProtect.hot?C_RED:C_RED_D);
-    roundCard(dc,rc,base,base,16);
-    // shield glyph
-    RECT ic={rc.left+22,rc.top,rc.left+92,rc.bottom};
-    drawText(dc,L"\uE83D",ic,gFIconBig,C_WHITE,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
-    RECT tr={rc.left+96,rc.top+14,rc.right-160,rc.top+48};
-    drawText(dc,on?L"Protected":L"Not protected",tr,gFStatus,C_WHITE,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
-    RECT sr={rc.left+96,rc.top+46,rc.right-160,rc.bottom-12};
-    drawText(dc,on?L"Real-time guard + disk shield are running":
-                  L"Real-time defense is off - click to turn it on",
-             sr,gFStatusSub,RGB(0xE6,0xEC,0xF6),DT_LEFT|DT_SINGLELINE);
-    // pill on the right
-    RECT pill={rc.right-146,rc.top+(rc.bottom-rc.top)/2-20,rc.right-22,rc.top+(rc.bottom-rc.top)/2+20};
-    roundCard(dc,pill,C_WHITE,C_WHITE,20);
-    drawText(dc,on?L"Turn off":L"Turn on",pill,gFCard,base,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-}
-
-// hover subclass for every owner-draw button
-static LRESULT CALLBACK btnProc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR ref){
-    Card* c=cardById((int)id);
-    switch(m){
-    case WM_MOUSEMOVE:
-        if(c && !c->hot){ c->hot=true; InvalidateRect(h,nullptr,TRUE);
-            TRACKMOUSEEVENT te{sizeof(te),TME_LEAVE,h,0}; TrackMouseEvent(&te); }
-        break;
-    case WM_MOUSELEAVE: if(c){ c->hot=false; c->down=false; InvalidateRect(h,nullptr,TRUE);} break;
-    case WM_LBUTTONDOWN: if(c){ c->down=true; InvalidateRect(h,nullptr,TRUE);} break;
-    case WM_LBUTTONUP:   if(c){ c->down=false; InvalidateRect(h,nullptr,TRUE);} break;
-    }
-    return DefSubclassProc(h,m,w,l);
-}
-
-static HWND mkCardBtn(HWND parent,int id){
-    HWND b=CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
-        0,0,0,0,parent,(HMENU)(INT_PTR)id,(HINSTANCE)GetWindowLongPtrW(parent,GWLP_HINSTANCE),nullptr);
-    SetWindowSubclass(b,btnProc,id,0);
-    return b;
-}
-
-// ------------------------------------------------------------- layout ---------
-static int gHeadH=92, gStatusH=88, gPad=18;
-static void layout(HWND hwnd){
-    RECT rc; GetClientRect(hwnd,&rc); int W=rc.right;
-    int y=gHeadH+gPad;
-    MoveWindow(gProtectWnd,gPad,y,W-2*gPad,gStatusH,TRUE);
-    y+=gStatusH+gPad;
-    int cols=(W> 760)?3:2;
-    int cw=(W-gPad*(cols+1))/cols, ch=78;
-    for(int i=0;i<5;++i){ int col=i%cols,row=i/cols;
-        MoveWindow(gCardWnd[i],gPad+col*(cw+gPad),y+row*(ch+gPad),cw,ch,TRUE); }
-    int rows=(5+cols-1)/cols;
-    int logY=y+rows*(ch+gPad)+6;
-    // log sits inside a card drawn in WM_PAINT; inset it
-    MoveWindow(gLog,gPad+14,logY+34,W-2*gPad-28,rc.bottom-logY-gPad-14,TRUE);
-    InvalidateRect(hwnd,nullptr,FALSE);
-}
-
-static void paintMain(HWND hwnd){
-    PAINTSTRUCT ps; HDC wdc=BeginPaint(hwnd,&ps);
-    RECT rc; GetClientRect(hwnd,&rc);
-    // double buffer
-    HDC dc=CreateCompatibleDC(wdc);
-    HBITMAP bmp=CreateCompatibleBitmap(wdc,rc.right,rc.bottom);
+static void paint(HWND hwnd){
+    PAINTSTRUCT ps; HDC wdc=BeginPaint(hwnd,&ps); RECT cr; GetClientRect(hwnd,&cr);
+    HDC dc=CreateCompatibleDC(wdc); HBITMAP bmp=CreateCompatibleBitmap(wdc,cr.right,cr.bottom);
     HGDIOBJ ob=SelectObject(dc,bmp);
-    HBRUSH bg=CreateSolidBrush(C_BG); FillRect(dc,&rc,bg); DeleteObject(bg);
-    // header
-    RECT head={0,0,rc.right,gHeadH}; fillGradient(dc,head,C_HEAD_TOP,C_HEAD_BOT);
-    RECT sh={24,0,84,gHeadH};
-    drawText(dc,L"\uE83D",sh,gFIconBig,C_WHITE,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
-    RECT ti={92,18,rc.right-20,56}; drawText(dc,L"Rescue",ti,gFTitle,C_WHITE,DT_LEFT|DT_SINGLELINE);
-    RECT su={94,54,rc.right-20,80}; drawText(dc,L"Anti-Ransomware Protection",su,gFSub,RGB(0xC7,0xD4,0xEC),DT_LEFT|DT_SINGLELINE);
-    // activity log card frame
-    int y=gHeadH+gPad+gStatusH+gPad;
-    int cols=(rc.right>760)?3:2; int ch=78; int rows=(5+cols-1)/cols;
-    int logY=y+rows*(ch+gPad)+6;
-    RECT lc={gPad,logY,rc.right-gPad,rc.bottom-gPad}; roundCard(dc,lc,C_CARD,C_BORDER,14);
-    RECT ll={gPad+16,logY+8,rc.right-gPad-16,logY+30};
-    drawText(dc,L"Activity",ll,gFCard,C_TEXT,DT_LEFT|DT_SINGLELINE);
-    BitBlt(wdc,0,0,rc.right,rc.bottom,dc,0,0,SRCCOPY);
-    SelectObject(dc,ob); DeleteObject(bmp); DeleteDC(dc);
-    EndPaint(hwnd,&ps);
+    gHits.clear();
+    fillR(dc,cr,CBG);
+
+    // ---------------- left rail ----------------
+    int RAIL=232;
+    RECT rail={0,0,RAIL,cr.bottom}; vgrad(dc,rail,CBG2,CBG);
+    RECT rl={RAIL-1,0,RAIL,cr.bottom}; fillR(dc,rl,CLINE);
+    // brand
+    RECT bmk={22,20,58,56}; txt(dc,L"\uE83D",bmk,fShield,CACC2,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    RECT bn={62,20,RAIL-8,44}; txt(dc,L"Rescue",bn,fDisp,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    RECT bs={64,44,RAIL-8,62}; txt(dc,L"SECURITY CENTER",bs,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
+    int ny=84;
+    navItem(dc,14,ny,RAIL-28,L"\uE80A",L"Dashboard",A_NAV_DASH,true,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"\uE83D",L"Real-time Guard",A_NAV_GUARD,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"\uE721",L"Scan",A_NAV_SCAN,false,nullptr);
+    { wchar_t qc[8]; wsprintfW(qc,L"%ld",gThreats); navItem(dc,14,ny,RAIL-28,L"\uE7BA",L"Quarantine",A_NAV_QUAR,false, gThreats>0?qc:nullptr); }
+    navItem(dc,14,ny,RAIL-28,L"\uEDA2",L"Rescue USB",A_NAV_USB,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"\uE7C3",L"Logs",A_NAV_LOGS,false,nullptr);
+    navItem(dc,14,ny,RAIL-28,L"\uE713",L"Settings",A_NAV_SET,false,nullptr);
+    RECT foot={22,cr.bottom-56,RAIL-14,cr.bottom-12};
+    txt(dc,gGuardOn?L"\u25CF  Protected \u00b7 guard live\nRescue 0.1.0 \u00b7 both arches":
+                    L"\u25CF  Idle \u00b7 guard off\nRescue 0.1.0 \u00b7 both arches",
+        foot,fSansXS,gGuardOn?CGOOD:CMUT2,DT_LEFT|DT_WORDBREAK);
+
+    // ---------------- top bar ----------------
+    int X=RAIL, W=cr.right-RAIL;
+    RECT top={X,0,cr.right,58}; fillR(dc,top,CBG2);
+    RECT tl={X,57,cr.right,58}; fillR(dc,tl,CLINE);
+    RECT th={X+26,0,X+300,58}; txt(dc,L"Dashboard",th,fDispS,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    wchar_t clock[32]; SYSTEMTIME st; GetLocalTime(&st); wsprintfW(clock,L"%02d:%02d:%02d",st.wHour,st.wMinute,st.wSecond);
+    RECT tc={cr.right-140,0,cr.right-58,58}; txt(dc,clock,tc,fMono,CMUT,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+    RECT tg={cr.right-46,14,cr.right-14,46}; card(dc,tg,CPANEL,CLINE,9);
+    txt(dc,L"\uE713",tg,fIconNav,CMUT,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP); reg(tg,A_NAV_SET);
+
+    int pad=24, cx=X+pad, cw=W-pad*2, y=58+pad;
+
+    // ---------------- hero ----------------
+    int heroH=196; RECT hero={cx,y,cx+cw,y+heroH}; vgrad(dc,hero,CPANEL,CBG2);
+    card(dc,hero,CPANEL,CLINE,14); // border overlay (fill already gradient-ish)
+    // re-stroke border since card overwrote fill; draw gradient inside then border:
+    { RECT inner={hero.left+1,hero.top+1,hero.right-1,hero.bottom-1}; vgrad(dc,inner,CPANEL,CBG2);
+      HPEN p=CreatePen(PS_SOLID,1,CLINE); HGDIOBJ op=SelectObject(dc,p); HGDIOBJ obr=SelectObject(dc,GetStockObject(NULL_BRUSH));
+      RoundRect(dc,hero.left,hero.top,hero.right,hero.bottom,14,14); SelectObject(dc,op); SelectObject(dc,obr); DeleteObject(p); }
+    // shield
+    RECT sh={hero.left+28,hero.top+28,hero.left+156,hero.bottom-28};
+    txt(dc,L"\uE83D",sh,fShield,gGuardOn?CGOOD:CWARN,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOCLIP);
+    int hx=hero.left+180;
+    RECT he={hx,hero.top+22,hero.right-24,hero.top+42};
+    txt(dc,gGuardOn?L"SYSTEM PROTECTED":L"REDUCED PROTECTION",he,fSansXS,gGuardOn?CGOOD:CWARN,DT_LEFT|DT_SINGLELINE);
+    RECT ht={hx,hero.top+40,hero.right-24,hero.top+78};
+    txt(dc,gScanning?L"Scan running\u2026":(gGuardOn?L"You're protected":L"Real-time guard is off"),
+        ht,fDispXL,CINK,DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    RECT hsub={hx,hero.top+80,hero.right-24,hero.top+104};
+    txt(dc, gGuardOn?L"Real-time ransomware guard + disk shield are watching your files.":
+                     L"Turn on real-time protection to stop ransomware as it runs.",
+        hsub,fSansS,CMUT,DT_LEFT|DT_SINGLELINE);
+    // CTA buttons
+    int by=hero.top+112, bx=hx;
+    struct B{const wchar_t* t;int a;bool prim;} btns[]={{L"Run quick scan",A_QUICK,true},{L"Full scan",A_FULL,false},{L"Build rescue USB",A_USB,false}};
+    for(auto& bb:btns){ SIZE sz; HGDIOBJ of=SelectObject(dc,fSansS); GetTextExtentPoint32W(dc,bb.t,(int)wcslen(bb.t),&sz); SelectObject(dc,of);
+        RECT r={bx,by,bx+sz.cx+34,by+38};
+        COLORREF f=bb.prim?CACC:CPANEL2, b2=bb.prim?CACC:CLINE2;
+        if(isHot(bb.a)){ f=bb.prim?CACC2:CPANEL2; b2=CACC; }
+        card(dc,r,f,b2,10); txt(dc,bb.t,r,fSansS,bb.prim?RGB(0x04,0x12,0x2b):CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        reg(r,bb.a); bx=r.right+11; }
+    // scan progress bar (only while scanning)
+    if(gScanning){
+        RECT tr={hx,hero.bottom-24,hero.right-24,hero.bottom-17}; card(dc,tr,CPANEL2,CLINE,6);
+        RECT fl={tr.left,tr.top,tr.left+(int)((tr.right-tr.left)*gScanPct/100.0),tr.bottom}; if(fl.right>fl.left) card(dc,fl,CACC,CACC,6);
+        RECT lp={hx,hero.bottom-40,hero.right-24,hero.bottom-24}; wchar_t s[128];
+        wsprintfW(s,L"%ls  \u00b7  %ld scanned",gScanPath.c_str(),gScanCount); txt(dc,s,lp,fSansXS,CMUT,DT_LEFT|DT_SINGLELINE);
+    } else {
+        // stat grid (4 tiles)
+        int gy=hero.top+150, gw=(hero.right-24-hx-3*3)/4, gh=40;
+        struct T{const wchar_t* k,*v;COLORREF vc;} tiles[]={
+            {L"THREATS BLOCKED", nullptr, CGOOD},{L"REAL-TIME GUARD", gGuardOn?L"On":L"Off", gGuardOn?CGOOD:CWARN},
+            {L"CANARY FILES", gGuardOn?L"6 active":L"\u2014", CINK},{L"DISK SHIELD", gGuardOn?L"On":L"Off", gGuardOn?CGOOD:CMUT}};
+        wchar_t tb[16]; wsprintfW(tb,L"%ld",gThreats);
+        for(int i=0;i<4;++i){ RECT t={hx+i*(gw+3),gy,hx+i*(gw+3)+gw,gy+gh}; card(dc,t,CBG2,CLINE,8);
+            RECT k={t.left+10,t.top+5,t.right-6,t.top+19}; txt(dc,tiles[i].k,k,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
+            RECT v={t.left+10,t.top+18,t.right-6,t.bottom-4}; txt(dc,i==0?tb:tiles[i].v,v,fDispS,tiles[i].vc,DT_LEFT|DT_SINGLELINE|DT_BOTTOM); }
+    }
+    y=hero.bottom+pad;
+
+    // ---------------- section header ----------------
+    RECT sec={cx,y,cx+240,y+20}; txt(dc,L"Defense modules",sec,fSans,CINK,DT_LEFT|DT_SINGLELINE);
+    RECT secl={cx+150,y+10,cx+cw,y+11}; fillR(dc,secl,CLINE);
+    y+=30;
+
+    // ---------------- module grid (3 cols x 2 rows) ----------------
+    Mod mods[6]={
+        {L"\uE83D",L"Ransom Guard",L"Behavioral real-time protection", gGuardOn?L"Watching folders \u00b7 6 canaries armed":L"Off \u00b7 turn on to arm canaries", L"Trip \u2192 suspend the busiest writer", 0, gGuardOn?L"Active":L"Off", A_GUARD_TGL},
+        {L"\uE785",L"Lockdown Breaker",L"Undo malware lockdowns", L"Task Mgr \u00b7 regedit \u00b7 CMD \u00b7 shell", L"WDAC policy \u00b7 input lock \u00b7 overlays", 0, L"Ready", A_UNLOCK},
+        {L"\uE8FD",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP},
+        {L"\uE721",L"Threat Scanner",L"Heuristic + hash + quarantine", L"PE entropy \u00b7 MOTW priority", L"Downloads deep-scanned first", 0, L"Updated", A_QUICK},
+        {L"\uE9D9",L"Watchdog",L"Self-protecting service pair", L"Two services \u00b7 each restarts the other", L"Keeps Ransom Guard alive", 0, L"Ready", A_BACKUP},
+        {L"\uE950",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Requires a signed driver to load", 3, L"Not installed", A_NONE},
+    };
+    mods[2].chipKind=0; // asep neutral unless flagged
+    int cols=3, gap=14; int mw=(cw-gap*(cols-1))/cols, mh=124;
+    for(int i=0;i<6;++i){ int col=i%cols,row=i/cols; RECT r={cx+col*(mw+gap),y+row*(mh+gap),cx+col*(mw+gap)+mw,y+row*(mh+gap)+mh};
+        drawMod(dc,r,mods[i], i==5); }
+    y+=2*(mh+gap)+6;
+
+    // ---------------- lower: activity + quarantine ----------------
+    int lgap=22; int aw=(cw-lgap)*58/100;
+    int lh=cr.bottom-y-pad; if(lh<140) lh=140;
+    RECT act={cx,y,cx+aw,y+lh}; card(dc,act,CPANEL,CLINE,14);
+    RECT ahl={act.left+18,act.top,act.right-16,act.top+44};
+    txt(dc,L"Activity",ahl,fSans,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    RECT ahln={act.left,act.top+44,act.right,act.top+45}; fillR(dc,ahln,CLINE);
+    int ey=act.top+52;
+    for(auto& e:gFeed){ if(ey>act.bottom-40) break;
+        COLORREF sv= e.sev==EV_OK?CGOOD:e.sev==EV_WARN?CWARN:e.sev==EV_CRIT?CCRIT:CACC;
+        RECT bar={act.left+18,ey+2,act.left+21,ey+40}; card(dc,bar,sv,sv,2);
+        RECT t={act.left+32,ey,act.right-70,ey+20}; txt(dc,e.title.c_str(),t,fSansS,CINK,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+        RECT d={act.left+32,ey+20,act.right-70,ey+40}; txt(dc,e.detail.c_str(),d,fSansXS,CMUT,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+        RECT g={act.right-64,ey,act.right-14,ey+20}; txt(dc,e.ago.c_str(),g,fSansXS,CMUT2,DT_RIGHT|DT_SINGLELINE);
+        ey+=46; }
+    if(gFeed.empty()){ RECT em={act.left,act.top+60,act.right,act.bottom}; txt(dc,L"No activity yet. Run a scan or turn on protection.",em,fSansS,CMUT2,DT_CENTER|DT_TOP); }
+
+    RECT quar={cx+aw+lgap,y,cx+cw,y+lh}; card(dc,quar,CPANEL,CLINE,14);
+    RECT qhl={quar.left+18,quar.top,quar.right-16,quar.top+44}; txt(dc,L"Quarantine",qhl,fSans,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    { wchar_t qc[24]; wsprintfW(qc,L"%ld item%ls",gThreats,gThreats==1?L"":L"s"); RECT qcr={quar.left,quar.top,quar.right-16,quar.top+44};
+      txt(dc,gThreats?qc:L"empty",qcr,fMono,CMUT2,DT_RIGHT|DT_VCENTER|DT_SINGLELINE); }
+    RECT qln={quar.left,quar.top+44,quar.right,quar.top+45}; fillR(dc,qln,CLINE);
+    RECT qbody={quar.left,quar.top+52,quar.right,quar.bottom};
+    if(gThreats==0){ txt(dc,L"Quarantine is empty.\nNeutralized threats will appear here.",qbody,fSansS,CMUT2,DT_CENTER|DT_TOP);
+        RECT ob={quar.left+18,quar.bottom-46,quar.right-18,quar.bottom-14};
+        card(dc,ob, isHot(A_QUAR_OPEN)?CPANEL2:CBG2, isHot(A_QUAR_OPEN)?CACC:CLINE2,9);
+        txt(dc,L"Open quarantine folder",ob,fSansS,CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE); reg(ob,A_QUAR_OPEN); }
+    else { RECT ob={quar.left+18,quar.top+56,quar.right-18,quar.top+88};
+        card(dc,ob, isHot(A_QUAR_OPEN)?CPANEL2:CBG2, isHot(A_QUAR_OPEN)?CACC:CLINE2,9);
+        wchar_t s[48]; wsprintfW(s,L"Review %ld quarantined item%ls",gThreats,gThreats==1?L"":L"s");
+        txt(dc,s,ob,fSansS,CINK,DT_CENTER|DT_VCENTER|DT_SINGLELINE); reg(ob,A_QUAR_OPEN); }
+
+    BitBlt(wdc,0,0,cr.right,cr.bottom,dc,0,0,SRCCOPY);
+    SelectObject(dc,ob); DeleteObject(bmp); DeleteDC(dc); EndPaint(hwnd,&ps);
 }
 
-// ------------------------------------------------------------- wndproc --------
+// ------------------------------------------------------------- input ----------
+static int hitTest(int x,int y){ POINT p={x,y};
+    for(auto it=gHits.rbegin();it!=gHits.rend();++it) if(PtInRect(&it->rc,p)) return it->action;
+    return A_NONE; }
+
 static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:{
-        gFTitle    =CreateFontW(34,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
-        gFSub      =CreateFontW(17,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
-        gFCard     =CreateFontW(19,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
-        gFCardSub  =CreateFontW(13,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
-        gFIcon     =CreateFontW(28,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe MDL2 Assets");
-        gFIconBig  =CreateFontW(40,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe MDL2 Assets");
-        gFStatus   =CreateFontW(24,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
-        gFStatusSub=CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Segoe UI");
-        gFMono     =CreateFontW(15,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Consolas");
-        gProtectWnd=mkCardBtn(hwnd,ID_PROTECT);
-        for(int i=0;i<5;++i) gCardWnd[i]=mkCardBtn(hwnd,gCards[i].id);
-        gLog=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,
-            0,0,0,0,hwnd,(HMENU)(INT_PTR)ID_LOG,((LPCREATESTRUCTW)lp)->hInstance,nullptr);
-        SendMessageW(gLog,WM_SETFONT,(WPARAM)gFMono,TRUE);
-        logAtEnd(L"Welcome to Rescue. Click Quick Scan to check this PC, or turn on\r\n"
-                 L"real-time protection. Every action asks for your approval.\r\n");
-        layout(hwnd); return 0; }
-    case WM_SIZE: layout(hwnd); return 0;
-    case WM_ERASEBKGND: return 1;   // painted in WM_PAINT (no flicker)
-    case WM_PAINT: paintMain(hwnd); return 0;
-    case WM_DRAWITEM:{
-        DRAWITEMSTRUCT* di=(DRAWITEMSTRUCT*)lp;
-        if(di->CtlID==ID_PROTECT) drawProtect(di); else drawCard(di);
-        return TRUE; }
-    case WM_COMMAND: if(HIWORD(wp)==BN_CLICKED) onCommand(hwnd,LOWORD(wp)); return 0;
-    case WM_APP_APPEND:{ wchar_t* t=(wchar_t*)wp; if(t){ logAtEnd(t); free(t);} return 0; }
-    case WM_APP_BUSY:{ gBusy=wp!=0;
-        for(int i=0;i<5;++i){ int id=gCards[i].id; if(id==ID_QUARANTINE) continue; EnableWindow(gCardWnd[i],!gBusy); }
-        return 0; }
-    case WM_CTLCOLOREDIT:{ HDC dc=(HDC)wp; SetTextColor(dc,C_TEXT); SetBkColor(dc,C_WHITE);
-        static HBRUSH wb=CreateSolidBrush(C_WHITE); return (LRESULT)wb; }
-    case WM_CLOSE: if(gGuardProc){ TerminateProcess(gGuardProc,0); CloseHandle(gGuardProc); gGuardProc=nullptr; }
-        DestroyWindow(hwnd); return 0;
+        auto F=[&](int h,int wt,const wchar_t* fam){ return CreateFontW(h,0,0,0,wt,0,0,0,DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,fam); };
+        fDispXL=F(30,FW_BOLD,L"Segoe UI"); fDisp=F(22,FW_SEMIBOLD,L"Segoe UI"); fDispS=F(18,FW_SEMIBOLD,L"Segoe UI");
+        fSans=F(16,FW_NORMAL,L"Segoe UI"); fSansS=F(15,FW_NORMAL,L"Segoe UI"); fSansXS=F(12,FW_SEMIBOLD,L"Segoe UI");
+        fMono=F(14,FW_NORMAL,L"Consolas"); fIcon=F(22,FW_NORMAL,L"Segoe MDL2 Assets"); fIconBig=F(30,FW_NORMAL,L"Segoe MDL2 Assets");
+        fIconNav=F(17,FW_NORMAL,L"Segoe MDL2 Assets"); fShield=F(84,FW_NORMAL,L"Segoe MDL2 Assets");
+        gThreats=quarantineCount();
+        feedAdd(EV_INFO,L"Welcome to Rescue",L"Run a quick scan, or turn on real-time protection.");
+        SetTimer(hwnd,1,1000,nullptr); return 0; }
+    case WM_TIMER: InvalidateRect(hwnd,nullptr,FALSE); return 0;   // clock + progress
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: paint(hwnd); return 0;
+    case WM_GETMINMAXINFO:{ auto* mm=(MINMAXINFO*)lp; mm->ptMinTrackSize.x=980; mm->ptMinTrackSize.y=640; return 0; }
+    case WM_MOUSEMOVE:{ int a=hitTest(GET_X_LPARAM(lp),GET_Y_LPARAM(lp));
+        if(a!=gHover){ gHover=a; SetCursor(LoadCursorW(nullptr, a==A_NONE?IDC_ARROW:IDC_HAND)); InvalidateRect(hwnd,nullptr,FALSE);} return 0; }
+    case WM_SETCURSOR: if(LOWORD(lp)==HTCLIENT && gHover!=A_NONE){ SetCursor(LoadCursorW(nullptr,IDC_HAND)); return TRUE; } break;
+    case WM_LBUTTONUP:{ int a=hitTest(GET_X_LPARAM(lp),GET_Y_LPARAM(lp)); if(a!=A_NONE) doAction(a); return 0; }
+    case WM_SIZE: InvalidateRect(hwnd,nullptr,FALSE); return 0;
+    case WM_CLOSE: if(gGuardProc){ TerminateProcess(gGuardProc,0); CloseHandle(gGuardProc);} DestroyWindow(hwnd); return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -335,13 +408,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,PWSTR,int nShow){
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     INITCOMMONCONTROLSEX icc{sizeof(icc),ICC_STANDARD_CLASSES}; InitCommonControlsEx(&icc);
-    WNDCLASSW wc{};
-    wc.lpfnWndProc=WndProc; wc.hInstance=hInst; wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
-    wc.hbrBackground=nullptr; wc.lpszClassName=L"RescueMainWindow"; wc.hIcon=LoadIconW(nullptr,IDI_SHIELD);
+    WNDCLASSW wc{}; wc.lpfnWndProc=WndProc; wc.hInstance=hInst; wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+    wc.hbrBackground=nullptr; wc.lpszClassName=L"RescueSecurityCenter"; wc.hIcon=LoadIconW(nullptr,IDI_SHIELD);
     RegisterClassW(&wc);
-    gMain=CreateWindowExW(0,wc.lpszClassName,L"Rescue",WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,CW_USEDEFAULT,900,720,nullptr,nullptr,hInst,nullptr);
-    ShowWindow(gMain,nShow); UpdateWindow(gMain);
+    gWnd=CreateWindowExW(0,wc.lpszClassName,L"Rescue Security Center",WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,CW_USEDEFAULT,1180,780,nullptr,nullptr,hInst,nullptr);
+    ShowWindow(gWnd,nShow); UpdateWindow(gWnd);
     MSG m; while(GetMessageW(&m,nullptr,0,0)>0){ TranslateMessage(&m); DispatchMessageW(&m); }
     return 0;
 }

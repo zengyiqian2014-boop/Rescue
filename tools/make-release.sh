@@ -12,21 +12,22 @@ mkdir -p "$OUT/x86_64" "$OUT/arm64"
 cp build/x86_64/*.exe "$OUT/x86_64/" 2>/dev/null || { echo "build x64 first (make x64)"; exit 1; }
 cp build/arm64/*.exe  "$OUT/arm64/"  2>/dev/null || { echo "build arm64 first (make arm64)"; exit 1; }
 
-cp Rescue.cmd "$OUT/"
 cp README.md "$OUT/"
-mkdir -p "$OUT/offline" "$OUT/installer" "$OUT/driver"
-cp offline/*   "$OUT/offline/"   2>/dev/null || true
-cp installer/* "$OUT/installer/" 2>/dev/null || true
-cp driver/*    "$OUT/driver/"    2>/dev/null || true
+# Advanced/edge tools (offline WinPE, driver signing) stay as scripts + source,
+# tucked under advanced/ so the product surface is the exes.
+mkdir -p "$OUT/advanced/offline" "$OUT/advanced/installer" "$OUT/advanced/driver"
+cp offline/*   "$OUT/advanced/offline/"   2>/dev/null || true
+cp installer/* "$OUT/advanced/installer/" 2>/dev/null || true
+cp driver/*    "$OUT/advanced/driver/"    2>/dev/null || true
 
 cat > "$OUT/START-HERE.txt" <<'TXT'
-RESCUE - defensive anti-ransomware / anti-malware toolkit
-=========================================================
+RESCUE - anti-ransomware / anti-malware security center
+======================================================
 
 QUICK START
-  Double-click  Rescue.cmd  and approve the admin prompt. Pick from the menu.
-  (32/64-bit Intel/AMD uses x86_64\, Windows-on-ARM uses arm64\ - the launcher
-   picks automatically.)
+  Double-click  x86_64\Rescue.exe   (or  arm64\Rescue.exe  on a Windows-on-ARM
+  PC) and approve the admin prompt. The Security Center window opens - one app,
+  big buttons, real-time protection toggle. Nothing to type.
 
 WHAT WORKS OUT OF THE BOX (no signing, no extra downloads)
   - Scanner            heuristic + hash file scanner, quarantine, scheduled scans
