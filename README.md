@@ -515,3 +515,5 @@ files, always review a scan before running `--fix`, and keep backups.
 ## License
 
 Provided as-is for defensive, educational, and administrative use. No warranty.
+
+Ctrl win O
