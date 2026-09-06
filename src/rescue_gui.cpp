@@ -145,11 +145,18 @@ static void doAction(int a){
         launchEngine(tool(L"lockdown_breaker.exe")+L" --fix --kill-overlays --kill-effects",false,(bool*)1); break;
     case A_ASEP: feedAdd(EV_INFO,L"Autostart scan started",L"Checking every ASEP against signatures");
         launchEngine(tool(L"asep_cleaner.exe"),false,(bool*)1); break;
-    case A_USB: case A_NAV_USB:
-        MessageBoxW(gWnd,L"Build a bootable rescue USB with:\n\n  offline\\Make-RescueDisk.ps1 -Drive F: -Mode bootable\n\n"
-                        L"or a one-click restore disk (official Windows ISO + your backup):\n\n"
-                        L"  offline\\Make-RescueDisk.ps1 -Drive F: -Mode oneclick -Iso <ISO>",
-                    L"Rescue USB",MB_ICONINFORMATION); break;
+    case A_USB: case A_NAV_USB:{
+        // Open the emergency kit (kept as PowerShell so it still runs if malware
+        // blocks .exe via WDAC/SRP policy). One click, no typing.
+        std::wstring kit=exeDir()+L"\\..\\advanced\\offline";
+        if(GetFileAttributesW(kit.c_str())==INVALID_FILE_ATTRIBUTES) kit=exeDir()+L"\\advanced\\offline";
+        if(GetFileAttributesW(kit.c_str())==INVALID_FILE_ATTRIBUTES) kit=exeDir();
+        ShellExecuteW(gWnd,L"explore",kit.c_str(),nullptr,nullptr,SW_SHOW);
+        MessageBoxW(gWnd,L"Opened the Rescue emergency kit.\n\nRun Make-RescueDisk.ps1 to build a bootable "
+                        L"rescue USB (bootable WinPE, or a one-click restore disk from an official Windows ISO + "
+                        L"your backup).\n\nThese stay as PowerShell on purpose: if malware blocks .exe files via "
+                        L"system policy, the .ps1 emergency kit still runs.",L"Rescue USB",MB_ICONINFORMATION);
+        break; }
     case A_BACKUP:{
         BROWSEINFOW bi{}; bi.hwndOwner=gWnd; bi.lpszTitle=L"Choose a BACKUP DISK or folder (external drive best)";
         bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE; LPITEMIDLIST pidl=SHBrowseForFolderW(&bi);
