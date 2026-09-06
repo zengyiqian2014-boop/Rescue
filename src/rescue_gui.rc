@@ -19,6 +19,44 @@ IDF_PLEX_RG   RCDATA "fonts/IBMPlexSans-Regular.ttf"
 IDF_PLEX_SB   RCDATA "fonts/IBMPlexSans-SemiBold.ttf"
 IDF_PLEXMONO  RCDATA "fonts/IBMPlexMono-Regular.ttf"
 
+// Application icon (gradient shield) - shown on the exe, title bar and taskbar.
+#define IDI_APPICON 1
+IDI_APPICON ICON "icons/rescue.ico"
+
+// UI icons, rendered from the design's SVGs to crisp transparent PNGs and drawn
+// with GDI+ (high-quality scaling; single-colour line icons are tinted per state
+// via a colour matrix). Names map to drawIcon(...) in rescue_gui.cpp.
+#define IDP_HOME        200
+#define IDP_SHIELD      201
+#define IDP_SHIELDCHECK 202
+#define IDP_SEARCH      203
+#define IDP_LIST        204
+#define IDP_USB         205
+#define IDP_PAGE        206
+#define IDP_GEAR        207
+#define IDP_UNLOCK      208
+#define IDP_ASEP        209
+#define IDP_DOG         210
+#define IDP_CPU         211
+#define IDP_BRAND       212
+#define IDP_HERO_ON     213
+#define IDP_HERO_OFF    214
+IDP_HOME        RCDATA "icons/home.png"
+IDP_SHIELD      RCDATA "icons/shield.png"
+IDP_SHIELDCHECK RCDATA "icons/shieldcheck.png"
+IDP_SEARCH      RCDATA "icons/search.png"
+IDP_LIST        RCDATA "icons/list.png"
+IDP_USB         RCDATA "icons/usb.png"
+IDP_PAGE        RCDATA "icons/page.png"
+IDP_GEAR        RCDATA "icons/gear.png"
+IDP_UNLOCK      RCDATA "icons/unlock.png"
+IDP_ASEP        RCDATA "icons/asep.png"
+IDP_DOG         RCDATA "icons/dog.png"
+IDP_CPU         RCDATA "icons/cpu.png"
+IDP_BRAND       RCDATA "icons/brand.png"
+IDP_HERO_ON     RCDATA "icons/hero_on.png"
+IDP_HERO_OFF    RCDATA "icons/hero_off.png"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 0,1,0,0
  PRODUCTVERSION 0,1,0,0

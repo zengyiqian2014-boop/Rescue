@@ -26,7 +26,7 @@ LIBS      = -ladvapi32 -lkernel32 -luser32 -lshlwapi -lwintrust -lcrypt32 -lbcry
 # The GUI app (rescue_gui) is a windowed program: WINDOWS subsystem instead of
 # console, plus common controls / shell / COM for the dashboard and folder picker.
 GUI_LDFLAGS = -Wl,--subsystem,windows -pthread
-GUI_LIBS    = $(LIBS) -lcomctl32 -lshell32 -lole32 -lgdi32
+GUI_LIBS    = $(LIBS) -lcomctl32 -lshell32 -lole32 -lgdi32 -lgdiplus
 
 # Console engines, built for both arches.
 TOOLS     = lockdown_breaker ransom_guard asep_cleaner watchdog scanner backup

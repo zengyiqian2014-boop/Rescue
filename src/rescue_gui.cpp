@@ -12,10 +12,13 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <commctrl.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <string>
 #include <vector>
 #include <deque>
 #include <thread>
+#include <map>
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -25,6 +28,26 @@
 #define IDF_PLEX_RG   103   // IBM Plex Sans  -> "IBM Plex Sans"
 #define IDF_PLEX_SB   104   // IBM Plex Sans SemiBold -> "IBM Plex Sans SemiBold"
 #define IDF_PLEXMONO  105   // IBM Plex Mono  -> "IBM Plex Mono"
+
+// Icon resource ids (must match src/rescue_gui.rc).
+#define IDI_APPICON 1
+#define IDP_HOME 200
+#define IDP_SHIELD 201
+#define IDP_SHIELDCHECK 202
+#define IDP_SEARCH 203
+#define IDP_LIST 204
+#define IDP_USB 205
+#define IDP_PAGE 206
+#define IDP_GEAR 207
+#define IDP_UNLOCK 208
+#define IDP_ASEP 209
+#define IDP_DOG 210
+#define IDP_CPU 211
+#define IDP_BRAND 212
+#define IDP_HERO_ON 213
+#define IDP_HERO_OFF 214
+
+static HINSTANCE gInst=nullptr;
 
 // Load the embedded UI fonts privately for this process (no install needed),
 // so the console renders with its intended type - Sora + IBM Plex - on any
@@ -236,52 +259,59 @@ static void chip(HDC dc,int x,int y,const wchar_t* s,COLORREF fg,COLORREF bg,COL
     HBRUSH b=CreateSolidBrush(fg); RECT d={x+10,y+8,x+16,y+14}; HGDIOBJ ob=SelectObject(dc,b);
     Ellipse(dc,d.left,d.top,d.right,d.bottom); SelectObject(dc,ob); DeleteObject(b);
     RECT tr={x+20,y,r.right,y+22}; txt(dc,s,tr,fSansXS,fg,DT_LEFT|DT_VCENTER|DT_SINGLELINE); }
-// crisp vector icons drawn with GDI - identical on every Windows, no icon font.
+// UI icons: crisp PNGs rendered from the design's SVGs, drawn with GDI+ (HQ
+// scaling). Single-colour line icons are tinted per state via a colour matrix;
+// the gradient shields (brand / hero) are drawn in full colour.
+static int iconId(const wchar_t* n){
+    struct M{const wchar_t* n;int id;};
+    static const M m[]={{L"home",IDP_HOME},{L"shield",IDP_SHIELD},{L"shieldcheck",IDP_SHIELDCHECK},
+        {L"search",IDP_SEARCH},{L"list",IDP_LIST},{L"usb",IDP_USB},{L"page",IDP_PAGE},{L"gear",IDP_GEAR},
+        {L"unlock",IDP_UNLOCK},{L"asep",IDP_ASEP},{L"dog",IDP_DOG},{L"cpu",IDP_CPU},
+        {L"brand",IDP_BRAND},{L"hero_on",IDP_HERO_ON},{L"hero_off",IDP_HERO_OFF}};
+    for(auto& e:m) if(wcscmp(e.n,n)==0) return e.id; return 0;
+}
+static Gdiplus::Bitmap* iconBmp(int id){
+    static std::map<int,Gdiplus::Bitmap*> cache;
+    auto it=cache.find(id); if(it!=cache.end()) return it->second;
+    Gdiplus::Bitmap* bm=nullptr;
+    HRSRC hr=FindResourceW(gInst,MAKEINTRESOURCEW(id),RT_RCDATA);
+    if(hr){ DWORD sz=SizeofResource(gInst,hr); HGLOBAL hg=LoadResource(gInst,hr); void* p=hg?LockResource(hg):nullptr;
+        if(p&&sz){ HGLOBAL buf=GlobalAlloc(GMEM_MOVEABLE,sz); if(buf){ void* q=GlobalLock(buf); if(q){ memcpy(q,p,sz); GlobalUnlock(buf);
+            IStream* st=nullptr; if(CreateStreamOnHGlobal(buf,TRUE,&st)==S_OK && st){ bm=Gdiplus::Bitmap::FromStream(st); st->Release(); }
+            if(bm && bm->GetLastStatus()!=Gdiplus::Ok){ delete bm; bm=nullptr; } } } } }
+    cache[id]=bm; return bm;
+}
+// A white line-icon tinted to `col` (source alpha preserved). Tinting is done on
+// the CPU and cached - GDI+'s ColorMatrix path renders wrong under some GDI+
+// implementations, whereas a plain DrawImage of a pre-tinted bitmap is reliable.
+static Gdiplus::Bitmap* tintedBmp(int id,COLORREF col){
+    static std::map<unsigned long long,Gdiplus::Bitmap*> cache;
+    unsigned long long key=((unsigned long long)(unsigned)id<<32)|(unsigned)(col&0xFFFFFF);
+    auto it=cache.find(key); if(it!=cache.end()) return it->second;
+    Gdiplus::Bitmap* src=iconBmp(id); Gdiplus::Bitmap* out=nullptr;
+    if(src){ int w=src->GetWidth(),h=src->GetHeight();
+        out=new Gdiplus::Bitmap(w,h,PixelFormat32bppARGB);
+        BYTE r=GetRValue(col),gg=GetGValue(col),bb=GetBValue(col);
+        for(int y=0;y<h;++y) for(int x=0;x<w;++x){ Gdiplus::Color c; src->GetPixel(x,y,&c);
+            out->SetPixel(x,y,Gdiplus::Color(c.GetA(),r,gg,bb)); }
+    }
+    cache[key]=out; return out;
+}
 static void drawIcon(HDC dc,const wchar_t* name,RECT b,COLORREF col){
-    double s=(b.right-b.left)/24.0; if(s<=0) return; int ox=b.left, oy=b.top;
-    int w=(int)(s*1.7); if(w<2) w=2;
-    LOGBRUSH lb{BS_SOLID,col,0};
-    HPEN pen=ExtCreatePen(PS_GEOMETRIC|PS_SOLID|PS_ENDCAP_ROUND|PS_JOIN_ROUND,w,&lb,0,nullptr);
-    HGDIOBJ op=SelectObject(dc,pen), obr=SelectObject(dc,GetStockObject(NULL_BRUSH));
-    auto P=[&](double x,double y){ POINT pt={(LONG)(ox+x*s),(LONG)(oy+y*s)}; return pt; };
-    auto L=[&](double x1,double y1,double x2,double y2){ POINT a=P(x1,y1),c=P(x2,y2); MoveToEx(dc,a.x,a.y,0); LineTo(dc,c.x,c.y); };
-    auto PL=[&](std::initializer_list<POINT> v){ std::vector<POINT> q(v); Polyline(dc,q.data(),(int)q.size()); };
-    auto EL=[&](double x1,double y1,double x2,double y2){ POINT a=P(x1,y1),c=P(x2,y2); Ellipse(dc,a.x,a.y,c.x,c.y); };
-    std::wstring n=name;
-    if(n==L"shield"){ PL({P(12,2),P(20,5),P(20,12),P(12,22),P(4,12),P(4,5),P(12,2)}); PL({P(8,12),P(11,15),P(16,8.5)}); }
-    else if(n==L"home"){ PL({P(4,11),P(12,4),P(20,11)}); PL({P(7,11),P(7,20),P(17,20),P(17,11)}); }
-    else if(n==L"search"){ EL(4,4,16,16); L(14.5,14.5,20,20); }
-    else if(n==L"warn"){ PL({P(12,3),P(21,20),P(3,20),P(12,3)}); L(12,9,12,15); L(12,17.6,12,18.2); }
-    else if(n==L"usb"){ PL({P(8,6),P(8,20),P(16,20),P(16,6),P(8,6)}); L(9.5,3,9.5,6); L(14.5,3,14.5,6); L(8,10,16,10); }
-    else if(n==L"page"){ PL({P(6,3),P(6,21),P(18,21),P(18,3),P(6,3)}); L(9,8,15,8); L(9,12,15,12); L(9,16,15,16); }
-    else if(n==L"gear"){ EL(7.5,7.5,16.5,16.5); L(12,3,12,6); L(12,18,12,21); L(3,12,6,12); L(18,12,21,12); L(5.5,5.5,7.6,7.6); L(16.4,16.4,18.5,18.5); L(16.4,7.6,18.5,5.5); L(7.6,16.4,5.5,18.5); }
-    else if(n==L"unlock"){ PL({P(6,11),P(6,20),P(18,20),P(18,11),P(6,11)}); PL({P(9,11),P(9,7),P(10.5,5),P(13.5,5),P(15,7)}); }
-    else if(n==L"list"){ L(5,7,19,7); L(5,12,19,12); L(5,17,15,17); }
-    else if(n==L"dog"){ EL(4,7.5,20,16.5); EL(10,11,14,15); }
-    else if(n==L"cpu"){ PL({P(7,7),P(7,17),P(17,17),P(17,7),P(7,7)}); PL({P(10,10),P(10,14),P(14,14),P(14,10),P(10,10)});
-        L(9,4,9,7); L(15,4,15,7); L(9,17,9,20); L(15,17,15,20); L(4,9,7,9); L(4,15,7,15); L(17,9,20,9); L(17,15,20,15); }
-    SelectObject(dc,op); SelectObject(dc,obr); DeleteObject(pen);
+    int id=iconId(name); if(!id) return;
+    bool grad = (wcscmp(name,L"brand")==0||wcscmp(name,L"hero_on")==0||wcscmp(name,L"hero_off")==0);
+    Gdiplus::Bitmap* bm = grad?iconBmp(id):tintedBmp(id,col); if(!bm) return;
+    Gdiplus::Graphics g(dc);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    Gdiplus::RectF dst((Gdiplus::REAL)b.left,(Gdiplus::REAL)b.top,
+                       (Gdiplus::REAL)(b.right-b.left),(Gdiplus::REAL)(b.bottom-b.top));
+    g.DrawImage(bm,dst,0,0,(Gdiplus::REAL)bm->GetWidth(),(Gdiplus::REAL)bm->GetHeight(),Gdiplus::UnitPixel);
 }
 
-// Hero centerpiece: a gradient-filled shield with a check mark (like the design).
-static void heroShield(HDC dc,RECT b,bool prot){
-    double s=(b.right-b.left)/24.0; if(s<=0) return; int ox=b.left, oy=b.top;
-    auto P=[&](double x,double y){ POINT p={(LONG)(ox+x*s),(LONG)(oy+y*s)}; return p; };
-    POINT poly[6]={P(12,2),P(20,5),P(20,12),P(12,22),P(4,12),P(4,5)};
-    HRGN rgn=CreatePolygonRgn(poly,6,WINDING); SelectClipRgn(dc,rgn);
-    if(prot) vgrad(dc,b,RGB(0x1c,0x3f,0x66),RGB(0x11,0x39,0x37));
-    else     vgrad(dc,b,RGB(0x3c,0x31,0x12),RGB(0x2a,0x22,0x0c));
-    SelectClipRgn(dc,nullptr); DeleteObject(rgn);
-    COLORREF sc=prot?CACC2:CWARN;
-    LOGBRUSH lb{BS_SOLID,sc,0};
-    HPEN pen=ExtCreatePen(PS_GEOMETRIC|PS_SOLID|PS_JOIN_ROUND|PS_ENDCAP_ROUND,(int)(s*1.3),&lb,0,nullptr);
-    HGDIOBJ op=SelectObject(dc,pen), ob=SelectObject(dc,GetStockObject(NULL_BRUSH));
-    Polygon(dc,poly,6);
-    COLORREF ck=prot?CGOOD:CWARN; LOGBRUSH lb2{BS_SOLID,ck,0};
-    HPEN pen2=ExtCreatePen(PS_GEOMETRIC|PS_SOLID|PS_JOIN_ROUND|PS_ENDCAP_ROUND,(int)(s*1.7),&lb2,0,nullptr);
-    SelectObject(dc,pen2); POINT ch[3]={P(8,12),P(11,15.2),P(16.5,8)}; Polyline(dc,ch,3);
-    SelectObject(dc,op); SelectObject(dc,ob); DeleteObject(pen); DeleteObject(pen2);
-}
+// Hero centerpiece: the design's gradient shield (green check when protected,
+// amber when the guard is off), rendered from the embedded PNG.
+static void heroShield(HDC dc,RECT b,bool prot){ drawIcon(dc,prot?L"hero_on":L"hero_off",b,0); }
 
 static void reg(RECT r,int a){ gHits.push_back({r,a}); }
 static bool isHot(int a){ return gHover==a && a!=A_NONE; }
@@ -433,14 +463,14 @@ static void paint(HWND hwnd){
     RECT rail={0,0,RAIL,cr.bottom}; vgrad(dc,rail,CBG2,CBG);
     RECT rl={RAIL-1,0,RAIL,cr.bottom}; fillR(dc,rl,CLINE);
     // brand
-    { RECT bmk={22,20,52,50}; drawIcon(dc,L"shield",bmk,CACC2); }
+    { RECT bmk={22,20,52,50}; drawIcon(dc,L"brand",bmk,0); }
     RECT bn={62,20,RAIL-8,44}; txt(dc,L"Rescue",bn,fDisp,CINK,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     RECT bs={64,44,RAIL-8,62}; txt(dc,L"SECURITY CENTER",bs,fSansXS,CMUT2,DT_LEFT|DT_SINGLELINE);
     int ny=84;
     navItem(dc,14,ny,RAIL-28,L"home",L"Dashboard",A_NAV_DASH,gView==VIEW_DASH,nullptr);
     navItem(dc,14,ny,RAIL-28,L"shield",L"Real-time Guard",A_NAV_GUARD,gView==VIEW_GUARD,nullptr);
     navItem(dc,14,ny,RAIL-28,L"search",L"Scan",A_NAV_SCAN,gView==VIEW_SCAN,nullptr);
-    { wchar_t qc[8]; wsprintfW(qc,L"%ld",gThreats); navItem(dc,14,ny,RAIL-28,L"warn",L"Quarantine",A_NAV_QUAR,gView==VIEW_QUAR, gThreats>0?qc:nullptr); }
+    { wchar_t qc[8]; wsprintfW(qc,L"%ld",gThreats); navItem(dc,14,ny,RAIL-28,L"list",L"Quarantine",A_NAV_QUAR,gView==VIEW_QUAR, gThreats>0?qc:nullptr); }
     navItem(dc,14,ny,RAIL-28,L"usb",L"Rescue USB",A_NAV_USB,gView==VIEW_USB,nullptr);
     navItem(dc,14,ny,RAIL-28,L"page",L"Logs",A_NAV_LOGS,gView==VIEW_LOGS,nullptr);
     navItem(dc,14,ny,RAIL-28,L"gear",L"Settings",A_NAV_SET,gView==VIEW_SET,nullptr);
@@ -534,9 +564,9 @@ static void paint(HWND hwnd){
 
     // ---------------- module grid (3 cols x 2 rows) ----------------
     Mod mods[6]={
-        {L"shield",L"Ransom Guard",L"Behavioral real-time protection", gGuardOn?L"Watching folders \u00b7 6 canaries armed":L"Off \u00b7 turn on to arm canaries", L"Trip \u2192 suspend the busiest writer", 0, gGuardOn?L"Active":L"Off", A_GUARD_TGL, gGuardOn?L"Live":L"Off", gGuardOn?L"Turn off":L"Turn on"},
+        {L"shieldcheck",L"Ransom Guard",L"Behavioral real-time protection", gGuardOn?L"Watching folders \u00b7 6 canaries armed":L"Off \u00b7 turn on to arm canaries", L"Trip \u2192 suspend the busiest writer", 0, gGuardOn?L"Active":L"Off", A_GUARD_TGL, gGuardOn?L"Live":L"Off", gGuardOn?L"Turn off":L"Turn on"},
         {L"unlock",L"Lockdown Breaker",L"Undo malware lockdowns", L"Task Mgr \u00b7 regedit \u00b7 CMD \u00b7 shell", L"WDAC policy \u00b7 input lock \u00b7 overlays", 0, L"Ready", A_UNLOCK, L"Idle", L"Scan now"},
-        {L"list",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP, L"Ready", L"Review"},
+        {L"asep",L"ASEP Cleaner",L"Every autostart, signature-checked", L"Run \u00b7 services \u00b7 tasks \u00b7 IFEO", L"Flags unsigned \u00b7 no virus DB needed", 0, L"Ready", A_ASEP, L"Ready", L"Review"},
         {L"search",L"Threat Scanner",L"Heuristic + hash + quarantine", L"PE entropy \u00b7 MOTW priority", L"Downloads deep-scanned first", 0, L"Updated", A_QUICK, L"Ready", L"Scan"},
         {L"dog",L"Watchdog",L"Self-protecting service pair", L"Two services \u00b7 each restarts the other", L"Keeps Ransom Guard alive", 0, L"Ready", A_BACKUP, L"Paired", L"Back up"},
         {L"cpu",L"Kernel Filter",L"Un-killable real-time tier", L"Minifilter \u00b7 per-write attribution", L"Requires a signed driver to load", 3, L"Not installed", A_NONE, L"Phase 6", L"Learn why"},
@@ -593,7 +623,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
 }
 
 int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,PWSTR,int nShow){
+    gInst=hInst;
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    ULONG_PTR gdiTok=0; Gdiplus::GdiplusStartupInput gsi; Gdiplus::GdiplusStartup(&gdiTok,&gsi,nullptr);
     INITCOMMONCONTROLSEX icc{sizeof(icc),ICC_STANDARD_CLASSES}; InitCommonControlsEx(&icc);
     loadBundledFonts(hInst);   // register Sora + IBM Plex before any font is made
     // Optional deep-link: open straight to a page, e.g. Rescue.exe --view=scan
@@ -607,11 +639,15 @@ int WINAPI wWinMain(HINSTANCE hInst,HINSTANCE,PWSTR,int nShow){
       if(cl.find(L"--demo")!=std::wstring::npos){ // render-preview only (screenshots)
           gScanning=true; gScanFull=false; gScanPct=63; gScanCount=18452; gScanPath=L"C:\\Users\\me\\Downloads"; }
     }
+    HICON hIcBig=(HICON)LoadImageW(hInst,MAKEINTRESOURCEW(IDI_APPICON),IMAGE_ICON,0,0,LR_DEFAULTSIZE);
+    HICON hIcSm =(HICON)LoadImageW(hInst,MAKEINTRESOURCEW(IDI_APPICON),IMAGE_ICON,16,16,0);
     WNDCLASSW wc{}; wc.lpfnWndProc=WndProc; wc.hInstance=hInst; wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
-    wc.hbrBackground=nullptr; wc.lpszClassName=L"RescueSecurityCenter"; wc.hIcon=LoadIconW(nullptr,IDI_SHIELD);
+    wc.hbrBackground=nullptr; wc.lpszClassName=L"RescueSecurityCenter"; wc.hIcon=hIcBig;
     RegisterClassW(&wc);
     gWnd=CreateWindowExW(0,wc.lpszClassName,L"Rescue Security Center",WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,CW_USEDEFAULT,1180,780,nullptr,nullptr,hInst,nullptr);
+    if(hIcBig) SendMessageW(gWnd,WM_SETICON,ICON_BIG,(LPARAM)hIcBig);
+    if(hIcSm)  SendMessageW(gWnd,WM_SETICON,ICON_SMALL,(LPARAM)hIcSm);
     ShowWindow(gWnd,nShow); UpdateWindow(gWnd);
     MSG m; while(GetMessageW(&m,nullptr,0,0)>0){ TranslateMessage(&m); DispatchMessageW(&m); }
     return 0;
